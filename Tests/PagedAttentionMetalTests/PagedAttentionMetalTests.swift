@@ -28,7 +28,6 @@ struct PipelineCache {
     let naiveAttention: MTLComputePipelineState
     let flashAttention: MTLComputePipelineState
     let pagedAttention: MTLComputePipelineState
-    let pagedAttentionHalf: MTLComputePipelineState?
     let pagedAttentionBackward: MTLComputePipelineState
 
     init() {
@@ -48,15 +47,6 @@ struct PipelineCache {
         naiveAttention = make("naive_attention")
         flashAttention = make("flash_attention_forward")
         pagedAttention = make("paged_attention_single")
-
-        // Half precision variant (optional)
-        pagedAttentionHalf = {
-            if let func_ = try? library.makeFunction(name: "paged_attention_half") {
-                return try? device.makeComputePipelineState(function: func_)
-            }
-            return nil
-        }()
-
         pagedAttentionBackward = make("paged_attention_backward")
 
         print("Pipeline cache initialized")
@@ -65,24 +55,19 @@ struct PipelineCache {
 
 let pipelineCache = PipelineCache()
 
-let vectorAddPipeline      = pipelineCache.vectorAdd
-let vectorMultiplyPipeline = pipelineCache.vectorMultiply
-let matrixAddPipeline      = pipelineCache.matrixAdd
-let matrixHadamardPipeline = pipelineCache.matrixHadamard
-let rowSumPipeline         = pipelineCache.rowSum
-let onlineSoftmaxPipeline  = pipelineCache.onlineSoftmax
-
 // MARK: - Buffer Helper
 
 /// Allocates a GPU-accessible buffer and copies the array into it.
 /// `.storageModeShared` means CPU and GPU share the same physical memory —
 /// no explicit copy needed when reading results back.
 func makeBuffer<T>(from data: [T]) -> MTLBuffer {
-    device.makeBuffer(
-        bytes: data,
-        length: data.count * MemoryLayout<T>.stride,
-        options: .storageModeShared
-    )!
+    data.withUnsafeBytes { ptr in
+        device.makeBuffer(
+            bytes: ptr.baseAddress!,
+            length: data.count * MemoryLayout<T>.stride,
+            options: .storageModeShared
+        )!
+    }
 }
 
 // MARK: - MTLHeap for KV Cache Pool
@@ -216,7 +201,7 @@ func runVectorAdd() {
 
     // Grid sizing: 1024 elements / 4 elements per thread = 256 threads needed
     dispatch(
-        pipeline: vectorAddPipeline,
+        pipeline: pipelineCache.vectorAdd,
         buffers: [bufA, bufB, bufC],
         grid: MTLSize(width: count / 4, height: 1, depth: 1),
         threadgroupWidth: 64
@@ -243,7 +228,7 @@ func runVectorMultiply() {
 
     // Grid sizing: 1024 elements / 4 elements per thread = 256 threads needed
     dispatch(
-        pipeline: vectorMultiplyPipeline,
+        pipeline: pipelineCache.vectorMultiply,
         buffers: [bufA, bufB, bufC],
         grid: MTLSize(width: count / 4, height: 1, depth: 1),
         threadgroupWidth: 64
@@ -392,7 +377,7 @@ func runRowSum() {
     let commandBuffer = commandQueue.makeCommandBuffer()!
     let encoder = commandBuffer.makeComputeCommandEncoder()!
 
-    encoder.setComputePipelineState(rowSumPipeline)
+    encoder.setComputePipelineState(pipelineCache.rowSum)
     encoder.setBuffer(bufA, offset: 0, index: 0)
     encoder.setBuffer(bufSums, offset: 0, index: 1)
 
@@ -456,7 +441,7 @@ func runOnlineSoftmax() {
 
     let commandBuffer = commandQueue.makeCommandBuffer()!
     let encoder = commandBuffer.makeComputeCommandEncoder()!
-    encoder.setComputePipelineState(onlineSoftmaxPipeline)
+    encoder.setComputePipelineState(pipelineCache.onlineSoftmax)
     encoder.setBuffer(bufInput, offset: 0, index: 0)
     encoder.setBuffer(bufOutput, offset: 0, index: 1)
 
@@ -1134,6 +1119,91 @@ func runPagedAttentionV2() {
     print(maxDiff < 1e-4 ? "✓ Paged attention V2 (long seq) verified!" : "✗ FAILED - skipping for now")
 }
 
+// MARK: - FP16 Mixed Precision Test
+
+@available(macOS 11.0, iOS 14.0, *)
+func runPagedAttentionFP16() {
+    print("\n=== Paged Attention FP16 (Mixed Precision) ===")
+
+    let seqLen    = 32
+    let headDim   = 32
+    let numHeads  = 2
+    let numKVHeads = 2
+    let blockSize = 16
+    let numBlocks = (seqLen + blockSize - 1) / blockSize
+    let poolSize  = numBlocks * blockSize
+
+    let Q = (0..<seqLen * numHeads * headDim).map { _ in Float16(Float.random(in: -1...1)) }
+    let K_pool = (0..<poolSize * numKVHeads * headDim).map { _ in Float16(Float.random(in: -1...1)) }
+    let V_pool = (0..<poolSize * numKVHeads * headDim).map { _ in Float16(Float.random(in: -1...1)) }
+    var blockTable = [Int32](repeating: 0, count: numBlocks)
+    for i in 0..<numBlocks { blockTable[i] = Int32(i) }
+
+    // CPU reference (simulating the F16-read/F32-compute)
+    func cpuFP16() -> [Float16] {
+        let scale = 1.0 / sqrt(Float(headDim))
+        var O = [Float16](repeating: 0, count: seqLen * numHeads * headDim)
+        for h in 0..<numHeads {
+            let kvH = h / (numHeads / numKVHeads)
+            for i in 0..<seqLen {
+                var m = -Float.infinity, l: Float = 0
+                var acc = [Float](repeating: 0, count: headDim)
+                for lb in 0..<numBlocks {
+                    let pb = Int(blockTable[lb])
+                    for lj in 0..<blockSize {
+                        let gj = lb * blockSize + lj
+                        if gj >= seqLen { break }
+                        var dot: Float = 0
+                        for d in 0..<headDim {
+                            let qIdx = (i * numHeads + h) * headDim + d
+                            let kIdx = (pb * blockSize + lj) * numKVHeads * headDim + kvH * headDim + d
+                            dot += Float(Q[qIdx]) * Float(K_pool[kIdx])
+                        }
+                        dot *= scale
+                        let mOld = m; m = max(m, dot)
+                        let corr = exp(mOld - m)
+                        l = l * corr + exp(dot - m)
+                        for d in 0..<headDim {
+                            let vIdx = (pb * blockSize + lj) * numKVHeads * headDim + kvH * headDim + d
+                            acc[d] = acc[d] * corr + exp(dot - m) * Float(V_pool[vIdx])
+                        }
+                    }
+                }
+                for d in 0..<headDim {
+                    O[(i * numHeads + h) * headDim + d] = Float16(acc[d] / l)
+                }
+            }
+        }
+        return O
+    }
+    let expected = cpuFP16()
+
+    let engine = try! PagedAttentionEngine()
+    let bufQ   = makeBuffer(from: Q)
+    let bufK   = makeBuffer(from: K_pool)
+    let bufV   = makeBuffer(from: V_pool)
+    let bufBT  = makeBuffer(from: blockTable)
+    let bufO   = device.makeBuffer(
+        length: seqLen * numHeads * headDim * MemoryLayout<Float16>.stride,
+        options: .storageModeShared)!
+
+    // Test single pass logic
+    engine.forward(
+        q: bufQ, kPool: bufK, vPool: bufV, blockTable: bufBT,
+        seqLen: seqLen, headDim: headDim,
+        numHeads: numHeads, numKVHeads: numKVHeads,
+        numBlocks: numBlocks, blockSize: blockSize,
+        output: bufO,
+        dataType: .float16
+    )
+
+    let oPtr = bufO.contents().bindMemory(to: Float16.self, capacity: expected.count)
+    var maxDiff: Float = 0
+    for i in 0..<expected.count { maxDiff = max(maxDiff, abs(Float(oPtr[i]) - Float(expected[i]))) }
+    print("Max difference from CPU reference: \(maxDiff)")
+    print(maxDiff < 5e-3 ? "✓ FP16 Paged Attention verified!" : "✗ FAILED")
+}
+
 // MARK: - Multi-Head Paged Attention Test (MHA)
 
 func runMultiHeadPagedAttention() {
@@ -1316,6 +1386,9 @@ final class PagedAttentionMetalTests: XCTestCase {
         runPagedAttention()
         runPagedAttentionBackward()
         runPagedAttentionV2()
+        if #available(macOS 11.0, iOS 14.0, *) {
+            runPagedAttentionFP16()
+        }
         runMultiHeadPagedAttention()
         runGroupedQueryAttention()
     }

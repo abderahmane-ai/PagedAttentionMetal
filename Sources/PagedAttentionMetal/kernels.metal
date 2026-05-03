@@ -44,6 +44,20 @@ inline float simd_dot_product(const device float* a, const device float* b, uint
     return sum;
 }
 
+inline float simd_dot_product_f16(const device half* a, const device half* b, uint head_dim) {
+    float sum = 0.0f;
+    uint d = 0;
+    for (; d + 4 <= head_dim; d += 4) {
+        float4 av = float4(*(device const half4*)(a + d));
+        float4 bv = float4(*(device const half4*)(b + d));
+        sum += dot(av, bv);
+    }
+    for (; d < head_dim; d++) {
+        sum += float(a[d]) * float(b[d]);
+    }
+    return sum;
+}
+
 inline float simd_dot_tile(const threadgroup float* a, uint a_offset, const threadgroup float* b, uint b_offset, uint head_dim) {
     float sum = 0.0f;
     uint d = 0;
@@ -645,4 +659,204 @@ kernel void paged_attention_split_phase2(
 
     // Output layout: [seq_len, num_heads, head_dim]
     O[(row * num_heads + head_idx) * head_dim + col] = global_acc / global_l;
+}
+
+// MARK: - FP16 Mixed Precision Kernels
+
+kernel void paged_attention_single_f16(
+    device const half    *Q            [[buffer(0)]],
+    device const half    *K_pool       [[buffer(1)]],
+    device const half    *V_pool       [[buffer(2)]],
+    device const int     *block_table  [[buffer(3)]],
+    device       half    *O            [[buffer(4)]],
+    constant uint        &seq_len      [[buffer(5)]],
+    constant uint        &head_dim     [[buffer(6)]],
+    constant uint        &num_heads    [[buffer(7)]],
+    constant uint        &num_kv_heads [[buffer(8)]],
+
+    uint3  gid              [[threadgroup_position_in_grid]],
+    uint3  lid              [[thread_position_in_threadgroup]],
+
+    threadgroup float *Q_tile   [[threadgroup(0)]],
+    threadgroup float *K_tile   [[threadgroup(1)]],
+    threadgroup float *V_tile   [[threadgroup(2)]]
+) {
+    const uint row_in_tile = lid.y;
+    const uint col         = lid.x;
+    const uint row         = gid.y * BLOCK_SIZE + row_in_tile;
+    const uint head_idx    = gid.z;
+    const uint kv_head_idx = head_idx / (num_heads / num_kv_heads);
+
+    const float scale = 1.0f / sqrt(float(head_dim));
+
+    float m_i   = -INFINITY;
+    float l_i   = 0.0f;
+    float acc_o = 0.0f;
+
+    if (row < seq_len && col < head_dim) {
+        Q_tile[row_in_tile * head_dim + col] = float(Q[(row * num_heads + head_idx) * head_dim + col]);
+    } else if (row_in_tile < BLOCK_SIZE && col < head_dim) {
+        Q_tile[row_in_tile * head_dim + col] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint k_block = 0; k_block < seq_len; k_block += BLOCK_SIZE) {
+        int logical_block = k_block / BLOCK_SIZE;
+        int physical_block = block_table[logical_block];
+
+        device const half* K_block_base = K_pool + physical_block * BLOCK_SIZE * num_kv_heads * head_dim;
+        device const half* V_block_base = V_pool + physical_block * BLOCK_SIZE * num_kv_heads * head_dim;
+
+        uint local_k_row = lid.y;
+        uint global_k_row = k_block + local_k_row;
+
+        if (global_k_row < seq_len && col < head_dim) {
+            K_tile[local_k_row * head_dim + col] = float(K_block_base[local_k_row * num_kv_heads * head_dim + kv_head_idx * head_dim + col]);
+            V_tile[local_k_row * head_dim + col] = float(V_block_base[local_k_row * num_kv_heads * head_dim + kv_head_idx * head_dim + col]);
+        } else {
+            K_tile[local_k_row * head_dim + col] = 0.0f;
+            V_tile[local_k_row * head_dim + col] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (row < seq_len && col < head_dim) {
+            for (uint local_j = 0; local_j < BLOCK_SIZE; local_j++) {
+                uint global_key_idx = k_block + local_j;
+                if (global_key_idx >= seq_len) continue;
+
+                float dot = simd_dot_tile(
+                    Q_tile, row_in_tile * head_dim,
+                    K_tile, local_j * head_dim,
+                    head_dim
+                );
+                dot *= scale;
+
+                float m_old = m_i;
+                m_i = max(m_i, dot);
+                float correction = exp(m_old - m_i);
+                l_i = l_i * correction + exp(dot - m_i);
+                acc_o = acc_o * correction;
+                acc_o += exp(dot - m_i) * V_tile[local_j * head_dim + col];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (row < seq_len && col < head_dim) {
+        O[(row * num_heads + head_idx) * head_dim + col] = half(acc_o / l_i);
+    }
+}
+
+kernel void paged_attention_split_phase1_f16(
+    device const half  *Q             [[buffer(0)]],
+    device const half  *K_pool        [[buffer(1)]],
+    device const half  *V_pool        [[buffer(2)]],
+    device const int   *block_table   [[buffer(3)]],
+    device float       *partial_out   [[buffer(4)]],
+    device float       *partial_m     [[buffer(5)]],
+    device float       *partial_l     [[buffer(6)]],
+    constant uint      &seq_len       [[buffer(7)]],
+    constant uint      &head_dim      [[buffer(8)]],
+    constant uint      &num_blocks    [[buffer(9)]],
+    constant uint      &num_heads     [[buffer(10)]],
+    constant uint      &num_kv_heads  [[buffer(11)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    const uint row       = gid.y;
+    const uint block_idx = gid.x;
+    const uint head_idx  = gid.z;
+
+    if (row >= seq_len || block_idx >= num_blocks || head_idx >= num_heads) return;
+
+    const uint kv_head_idx = head_idx / (num_heads / num_kv_heads);
+
+    int physical_block = block_table[block_idx];
+    device const half* K_block = K_pool + physical_block * BLOCK_SIZE * num_kv_heads * head_dim;
+    device const half* V_block = V_pool + physical_block * BLOCK_SIZE * num_kv_heads * head_dim;
+
+    const float scale = 1.0f / sqrt(float(head_dim));
+
+    float m_i = -INFINITY;
+    float l_i = 0.0f;
+    float acc_o[128]; // max head_dim = 128
+    for (uint d = 0; d < head_dim; d++) acc_o[d] = 0.0f;
+
+    for (uint local_j = 0; local_j < BLOCK_SIZE; local_j++) {
+        uint global_j = block_idx * BLOCK_SIZE + local_j;
+        if (global_j >= seq_len) break;
+
+        device const half* K_token = K_block + local_j * num_kv_heads * head_dim + kv_head_idx * head_dim;
+        device const half* V_token = V_block + local_j * num_kv_heads * head_dim + kv_head_idx * head_dim;
+
+        // Perform vectorized dot product
+        float dot = simd_dot_product_f16(Q + (row * num_heads + head_idx) * head_dim, K_token, head_dim);
+        dot *= scale;
+
+        float m_old = m_i;
+        m_i = max(m_i, dot);
+        float correction = exp(m_old - m_i);
+        l_i = l_i * correction + exp(dot - m_i);
+
+        float exp_weight = exp(dot - m_i);
+        uint d = 0;
+        for (; d + 4 <= head_dim; d += 4) {
+            float4 v_vec = float4(*(device const half4*)(V_token + d));
+            float4 acc_vec = float4(acc_o[d], acc_o[d+1], acc_o[d+2], acc_o[d+3]);
+            acc_vec = acc_vec * correction + exp_weight * v_vec;
+            acc_o[d]   = acc_vec.x;
+            acc_o[d+1] = acc_vec.y;
+            acc_o[d+2] = acc_vec.z;
+            acc_o[d+3] = acc_vec.w;
+        }
+        for (; d < head_dim; d++) {
+            acc_o[d] = acc_o[d] * correction + exp_weight * float(V_token[d]);
+        }
+    }
+
+    uint partial_idx = (head_idx * seq_len + row) * num_blocks + block_idx;
+    partial_m[partial_idx] = m_i;
+    partial_l[partial_idx] = l_i;
+    for (uint d = 0; d < head_dim; d++) {
+        partial_out[partial_idx * head_dim + d] = acc_o[d];
+    }
+}
+
+kernel void paged_attention_split_phase2_f16(
+    device const float *partial_out   [[buffer(0)]],
+    device const float *partial_m     [[buffer(1)]],
+    device const float *partial_l     [[buffer(2)]],
+    device half        *O             [[buffer(3)]],
+    constant uint      &seq_len       [[buffer(4)]],
+    constant uint      &head_dim      [[buffer(5)]],
+    constant uint      &num_blocks    [[buffer(6)]],
+    constant uint      &num_heads     [[buffer(7)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    const uint row      = gid.y;
+    const uint col      = gid.x;
+    const uint head_idx = gid.z;
+
+    if (row >= seq_len || col >= head_dim || head_idx >= num_heads) return;
+
+    float global_m = -INFINITY;
+    float global_l = 0.0f;
+    float global_acc = 0.0f;
+
+    for (uint block_idx = 0; block_idx < num_blocks; block_idx++) {
+        uint partial_idx = (head_idx * seq_len + row) * num_blocks + block_idx;
+        float p_m = partial_m[partial_idx];
+        float p_l = partial_l[partial_idx];
+        float p_out = partial_out[partial_idx * head_dim + col];
+
+        if (p_m == -INFINITY) continue;
+
+        float m_old = global_m;
+        global_m = max(global_m, p_m);
+        float correction = exp(m_old - global_m);
+
+        global_l = global_l * correction + p_l * exp(p_m - global_m);
+        global_acc = global_acc * correction + p_out * exp(p_m - global_m);
+    }
+
+    O[(row * num_heads + head_idx) * head_dim + col] = half(global_acc / global_l);
 }

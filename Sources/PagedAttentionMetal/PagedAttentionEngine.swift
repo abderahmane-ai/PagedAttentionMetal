@@ -11,6 +11,14 @@ public enum PagedAttentionError: Error {
     case pipelineCreationFailed
 }
 
+/// Defines the underlying precision of the memory buffers passed to the engine.
+public enum PagedAttentionDataType {
+    /// Standard 32-bit floating point precision.
+    case float32
+    /// 16-bit half precision. Uses Mixed-Precision under the hood (memory in Float16, compute in Float32).
+    case float16
+}
+
 /// A highly optimized, hardware-accelerated orchestrator for Paged Attention on Apple Silicon.
 ///
 /// `PagedAttentionEngine` abstracts away the complexity of GPU compute pipelines, threadgroup memory
@@ -23,6 +31,10 @@ public class PagedAttentionEngine {
     private let singlePassPipeline: MTLComputePipelineState
     private let splitPhase1Pipeline: MTLComputePipelineState
     private let splitPhase2Pipeline: MTLComputePipelineState
+
+    private let singlePassPipelineF16: MTLComputePipelineState
+    private let splitPhase1PipelineF16: MTLComputePipelineState
+    private let splitPhase2PipelineF16: MTLComputePipelineState
     
     /// The context window sequence length threshold that triggers the V2 Split-K kernel.
     ///
@@ -56,13 +68,20 @@ public class PagedAttentionEngine {
         
         guard let funcSingle = library.makeFunction(name: "paged_attention_single"),
               let funcSplit1 = library.makeFunction(name: "paged_attention_split_phase1"),
-              let funcSplit2 = library.makeFunction(name: "paged_attention_split_phase2") else {
+              let funcSplit2 = library.makeFunction(name: "paged_attention_split_phase2"),
+              let funcSingleF16 = library.makeFunction(name: "paged_attention_single_f16"),
+              let funcSplit1F16 = library.makeFunction(name: "paged_attention_split_phase1_f16"),
+              let funcSplit2F16 = library.makeFunction(name: "paged_attention_split_phase2_f16") else {
             throw PagedAttentionError.pipelineCreationFailed
         }
         
         self.singlePassPipeline = try device.makeComputePipelineState(function: funcSingle)
         self.splitPhase1Pipeline = try device.makeComputePipelineState(function: funcSplit1)
         self.splitPhase2Pipeline = try device.makeComputePipelineState(function: funcSplit2)
+        
+        self.singlePassPipelineF16 = try device.makeComputePipelineState(function: funcSingleF16)
+        self.splitPhase1PipelineF16 = try device.makeComputePipelineState(function: funcSplit1F16)
+        self.splitPhase2PipelineF16 = try device.makeComputePipelineState(function: funcSplit2F16)
     }
     
     /// Executes the forward attention pass directly on the GPU.
@@ -81,7 +100,8 @@ public class PagedAttentionEngine {
     ///   - numKVHeads: Number of key/value heads. Set equal to `numHeads` for MHA, 1 for MQA, or any divisor for GQA.
     ///   - numBlocks: Total number of physical KV blocks allocated in the pool.
     ///   - blockSize: Tokens stored per physical block. Default is 16.
-    ///   - output: Destination buffer — layout `[seq_len, num_heads, head_dim]` (`Float`).
+    ///   - output: Destination buffer — layout `[seq_len, num_heads, head_dim]` (`Float` or `Float16`).
+    ///   - dataType: The underlying buffer memory precision. Default is `.float32`.
     public func forward(
         q: MTLBuffer,
         kPool: MTLBuffer,
@@ -93,31 +113,34 @@ public class PagedAttentionEngine {
         numKVHeads: Int,
         numBlocks: Int,
         blockSize: Int = 16,
-        output: MTLBuffer
+        output: MTLBuffer,
+        dataType: PagedAttentionDataType = .float32
     ) {
         if seqLen <= splitThreshold {
             forwardSinglePass(
                 q: q, kPool: kPool, vPool: vPool, blockTable: blockTable,
                 seqLen: seqLen, headDim: headDim, numHeads: numHeads, numKVHeads: numKVHeads,
-                blockSize: blockSize, output: output
+                blockSize: blockSize, output: output, dataType: dataType
             )
         } else {
             forwardSplitPass(
                 q: q, kPool: kPool, vPool: vPool, blockTable: blockTable,
                 seqLen: seqLen, headDim: headDim, numHeads: numHeads, numKVHeads: numKVHeads,
-                numBlocks: numBlocks, blockSize: blockSize, output: output
+                numBlocks: numBlocks, blockSize: blockSize, output: output, dataType: dataType
             )
         }
     }
 
     private func forwardSinglePass(
         q: MTLBuffer, kPool: MTLBuffer, vPool: MTLBuffer, blockTable: MTLBuffer,
-        seqLen: Int, headDim: Int, numHeads: Int, numKVHeads: Int, blockSize: Int, output: MTLBuffer
+        seqLen: Int, headDim: Int, numHeads: Int, numKVHeads: Int, blockSize: Int, output: MTLBuffer,
+        dataType: PagedAttentionDataType
     ) {
         guard let cb = commandQueue.makeCommandBuffer(),
               let enc = cb.makeComputeCommandEncoder() else { return }
 
-        enc.setComputePipelineState(singlePassPipeline)
+        let pipeline = (dataType == .float16) ? singlePassPipelineF16 : singlePassPipeline
+        enc.setComputePipelineState(pipeline)
         enc.setBuffer(q, offset: 0, index: 0)
         enc.setBuffer(kPool, offset: 0, index: 1)
         enc.setBuffer(vPool, offset: 0, index: 2)
@@ -152,7 +175,8 @@ public class PagedAttentionEngine {
     private func forwardSplitPass(
         q: MTLBuffer, kPool: MTLBuffer, vPool: MTLBuffer, blockTable: MTLBuffer,
         seqLen: Int, headDim: Int, numHeads: Int, numKVHeads: Int,
-        numBlocks: Int, blockSize: Int, output: MTLBuffer
+        numBlocks: Int, blockSize: Int, output: MTLBuffer,
+        dataType: PagedAttentionDataType
     ) {
         // Intermediate buffers sized for all heads: [num_heads, seq_len, num_blocks, ...]
         let partialOut = device.makeBuffer(
@@ -175,7 +199,8 @@ public class PagedAttentionEngine {
 
         // --- Phase 1: per-block partial attention (parallelized across heads via depth) ---
         let enc1 = cb.makeComputeCommandEncoder()!
-        enc1.setComputePipelineState(splitPhase1Pipeline)
+        let p1 = (dataType == .float16) ? splitPhase1PipelineF16 : splitPhase1Pipeline
+        enc1.setComputePipelineState(p1)
         enc1.setBuffer(q, offset: 0, index: 0)
         enc1.setBuffer(kPool, offset: 0, index: 1)
         enc1.setBuffer(vPool, offset: 0, index: 2)
@@ -196,7 +221,8 @@ public class PagedAttentionEngine {
 
         // --- Phase 2: global Online Safe Softmax reduction across all blocks ---
         let enc2 = cb.makeComputeCommandEncoder()!
-        enc2.setComputePipelineState(splitPhase2Pipeline)
+        let p2 = (dataType == .float16) ? splitPhase2PipelineF16 : splitPhase2Pipeline
+        enc2.setComputePipelineState(p2)
         enc2.setBuffer(partialOut, offset: 0, index: 0)
         enc2.setBuffer(partialM, offset: 0, index: 1)
         enc2.setBuffer(partialL, offset: 0, index: 2)
