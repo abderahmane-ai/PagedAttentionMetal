@@ -112,14 +112,22 @@ public class PagedAttentionEngine {
         output: MTLBuffer,
         dataType: PagedAttentionDataType = .float16
     ) {
-        if seqLen <= splitThreshold {
-            prefillSinglePass(
+        // Check if single-pass fits in threadgroup memory
+        let bytesPerElement = (dataType == .float16) ? 2 : 4
+        let requiredMemory = blockSize * headDim * bytesPerElement * 3 // Q, K, V tiles
+        let maxThreadgroupMemory = device.maxThreadgroupMemoryLength
+        
+        // Auto-switch to split-K if memory exceeds limit or sequence is long
+        let useSplitPass = (requiredMemory > maxThreadgroupMemory) || (seqLen > splitThreshold)
+        
+        if useSplitPass {
+            prefillSplitPass(
                 q: q, kPool: kPool, vPool: vPool, blockTable: blockTable,
                 seqLen: seqLen, headDim: headDim, numHeads: numHeads, numKVHeads: numKVHeads,
                 blockSize: blockSize, causal: causal, output: output, dataType: dataType
             )
         } else {
-            prefillSplitPass(
+            prefillSinglePass(
                 q: q, kPool: kPool, vPool: vPool, blockTable: blockTable,
                 seqLen: seqLen, headDim: headDim, numHeads: numHeads, numKVHeads: numKVHeads,
                 blockSize: blockSize, causal: causal, output: output, dataType: dataType
