@@ -65,13 +65,12 @@ struct PipelineCache {
 
 let pipelineCache = PipelineCache()
 
-// Pipeline aliases for backward compatibility
-let vectorAddPipeline = pipelineCache.vectorAdd
+let vectorAddPipeline      = pipelineCache.vectorAdd
 let vectorMultiplyPipeline = pipelineCache.vectorMultiply
-let matrixAddPipeline = pipelineCache.matrixAdd
+let matrixAddPipeline      = pipelineCache.matrixAdd
 let matrixHadamardPipeline = pipelineCache.matrixHadamard
-let rowSumPipeline = pipelineCache.rowSum
-let onlineSoftmaxPipeline = pipelineCache.onlineSoftmax
+let rowSumPipeline         = pipelineCache.rowSum
+let onlineSoftmaxPipeline  = pipelineCache.onlineSoftmax
 
 // MARK: - Buffer Helper
 
@@ -420,7 +419,6 @@ func runRowSum() {
 
     print("Row\tComputed\tExpected")
     for r in 0..<rows {
-        let _ = abs(result[r] - expectedSums[r])
         print("\(r)\t\(result[r])\t\t\(expectedSums[r])")
     }
     verify(result: result, expected: expectedSums, label: "Row Sum")
@@ -774,8 +772,12 @@ func runPagedAttention() {
     encoder.setBuffer(bufO, offset: 0, index: 4)
     var sl = UInt32(seqLen)
     var hd = UInt32(headDim)
-    encoder.setBytes(&sl, length: MemoryLayout<UInt32>.stride, index: 5)
-    encoder.setBytes(&hd, length: MemoryLayout<UInt32>.stride, index: 6)
+    var nh = UInt32(1)   // single head
+    var nkv = UInt32(1)  // single KV head
+    encoder.setBytes(&sl,  length: MemoryLayout<UInt32>.stride, index: 5)
+    encoder.setBytes(&hd,  length: MemoryLayout<UInt32>.stride, index: 6)
+    encoder.setBytes(&nh,  length: MemoryLayout<UInt32>.stride, index: 7)
+    encoder.setBytes(&nkv, length: MemoryLayout<UInt32>.stride, index: 8)
 
     encoder.setThreadgroupMemoryLength(tileMemSize, index: 0)
     encoder.setThreadgroupMemoryLength(tileMemSize, index: 1)
@@ -1007,9 +1009,9 @@ func runPagedAttentionV2() {
     let headDim = 64
     let poolSize = numBlocks * blockSize
 
-    var Q = (0..<seqLen * headDim).map { _ in Float.random(in: -1...1) }
-    var K_pool = (0..<poolSize * headDim).map { _ in Float.random(in: -1...1) }
-    var V_pool = (0..<poolSize * headDim).map { _ in Float.random(in: -1...1) }
+    let Q = (0..<seqLen * headDim).map { _ in Float.random(in: -1...1) }
+    let K_pool = (0..<poolSize * headDim).map { _ in Float.random(in: -1...1) }
+    let V_pool = (0..<poolSize * headDim).map { _ in Float.random(in: -1...1) }
     // Note: use Int32 to match Metal's `int` type (not 64-bit Int)
     var blockTable = [Int32](repeating: 0, count: numBlocks)
     for i in 0..<numBlocks { blockTable[i] = Int32(i) }
@@ -1091,9 +1093,13 @@ func runPagedAttentionV2() {
         enc1.setBuffer(bufPartialOut, offset: 0, index: 4)
         enc1.setBuffer(bufPartialM, offset: 0, index: 5)
         enc1.setBuffer(bufPartialL, offset: 0, index: 6)
-        enc1.setBytes(&seqLenVar, length: 4, index: 7)
-        enc1.setBytes(&headDimVar, length: 4, index: 8)
+        enc1.setBytes(&seqLenVar,    length: 4, index: 7)
+        enc1.setBytes(&headDimVar,   length: 4, index: 8)
         enc1.setBytes(&numBlocksVar, length: 4, index: 9)
+        var numHeadsVar1 = UInt32(1)
+        var numKVVar1    = UInt32(1)
+        enc1.setBytes(&numHeadsVar1, length: 4, index: 10)
+        enc1.setBytes(&numKVVar1,    length: 4, index: 11)
         enc1.dispatchThreads(grid1, threadsPerThreadgroup: tgroup1)
         enc1.endEncoding()
 
@@ -1103,9 +1109,11 @@ func runPagedAttentionV2() {
         enc2.setBuffer(bufPartialM, offset: 0, index: 1)
         enc2.setBuffer(bufPartialL, offset: 0, index: 2)
         enc2.setBuffer(bufO, offset: 0, index: 3)
-        enc2.setBytes(&seqLenVar, length: 4, index: 4)
-        enc2.setBytes(&headDimVar, length: 4, index: 5)
+        enc2.setBytes(&seqLenVar,    length: 4, index: 4)
+        enc2.setBytes(&headDimVar,   length: 4, index: 5)
         enc2.setBytes(&numBlocksVar, length: 4, index: 6)
+        var numHeadsVar2 = UInt32(1)
+        enc2.setBytes(&numHeadsVar2, length: 4, index: 7)
         enc2.dispatchThreads(grid2, threadsPerThreadgroup: tgroup2)
         enc2.endEncoding()
         
@@ -1126,6 +1134,171 @@ func runPagedAttentionV2() {
     print(maxDiff < 1e-4 ? "✓ Paged attention V2 (long seq) verified!" : "✗ FAILED - skipping for now")
 }
 
+// MARK: - Multi-Head Paged Attention Test (MHA)
+
+func runMultiHeadPagedAttention() {
+    print("\n=== Multi-Head Paged Attention (MHA, 4 heads) ===")
+
+    let seqLen    = 32
+    let headDim   = 32
+    let numHeads  = 4
+    let numKVHeads = 4  // Full MHA
+    let blockSize = 16
+    let numBlocks = (seqLen + blockSize - 1) / blockSize
+    let poolSize  = numBlocks * blockSize
+
+    // Q layout: [seqLen, numHeads, headDim]
+    let Q = (0..<seqLen * numHeads * headDim).map { _ in Float.random(in: -1...1) }
+    // K/V pool layout: [numBlocks, blockSize, numKVHeads, headDim]
+    let K_pool = (0..<poolSize * numKVHeads * headDim).map { _ in Float.random(in: -1...1) }
+    let V_pool = (0..<poolSize * numKVHeads * headDim).map { _ in Float.random(in: -1...1) }
+    var blockTable = [Int32](repeating: 0, count: numBlocks)
+    for i in 0..<numBlocks { blockTable[i] = Int32(i) }
+
+    // CPU reference: loop over each head independently
+    func cpuMHA() -> [Float] {
+        let scale = 1.0 / sqrt(Float(headDim))
+        var O = [Float](repeating: 0, count: seqLen * numHeads * headDim)
+        for h in 0..<numHeads {
+            let kvH = h / (numHeads / numKVHeads)
+            for i in 0..<seqLen {
+                var m = -Float.infinity, l: Float = 0
+                var acc = [Float](repeating: 0, count: headDim)
+                for lb in 0..<numBlocks {
+                    let pb = Int(blockTable[lb])
+                    for lj in 0..<blockSize {
+                        let gj = lb * blockSize + lj
+                        if gj >= seqLen { break }
+                        var dot: Float = 0
+                        for d in 0..<headDim {
+                            let qIdx = (i * numHeads + h) * headDim + d
+                            let kIdx = (pb * blockSize + lj) * numKVHeads * headDim + kvH * headDim + d
+                            dot += Q[qIdx] * K_pool[kIdx]
+                        }
+                        dot *= scale
+                        let mOld = m; m = max(m, dot)
+                        let corr = exp(mOld - m)
+                        l = l * corr + exp(dot - m)
+                        for d in 0..<headDim {
+                            let vIdx = (pb * blockSize + lj) * numKVHeads * headDim + kvH * headDim + d
+                            acc[d] = acc[d] * corr + exp(dot - m) * V_pool[vIdx]
+                        }
+                    }
+                }
+                for d in 0..<headDim {
+                    O[(i * numHeads + h) * headDim + d] = acc[d] / l
+                }
+            }
+        }
+        return O
+    }
+    let expected = cpuMHA()
+
+    let engine = try! PagedAttentionEngine()
+    let bufQ   = makeBuffer(from: Q)
+    let bufK   = makeBuffer(from: K_pool)
+    let bufV   = makeBuffer(from: V_pool)
+    let bufBT  = makeBuffer(from: blockTable)
+    let bufO   = device.makeBuffer(
+        length: seqLen * numHeads * headDim * MemoryLayout<Float>.stride,
+        options: .storageModeShared)!
+
+    engine.forward(
+        q: bufQ, kPool: bufK, vPool: bufV, blockTable: bufBT,
+        seqLen: seqLen, headDim: headDim,
+        numHeads: numHeads, numKVHeads: numKVHeads,
+        numBlocks: numBlocks, blockSize: blockSize,
+        output: bufO
+    )
+
+    let result = readFloats(from: bufO, count: seqLen * numHeads * headDim)
+    var maxDiff: Float = 0
+    for i in 0..<result.count { maxDiff = max(maxDiff, abs(result[i] - expected[i])) }
+    print("Max difference from CPU reference: \(maxDiff)")
+    print(maxDiff < 1e-4 ? "✓ Multi-head paged attention (MHA) verified!" : "✗ FAILED")
+}
+
+// MARK: - Grouped Query Attention Test (GQA)
+
+func runGroupedQueryAttention() {
+    print("\n=== Grouped-Query Attention (GQA: 8Q / 2KV heads) ===")
+
+    let seqLen     = 32
+    let headDim    = 32
+    let numHeads   = 8
+    let numKVHeads = 2  // GQA: 4 query heads share each KV head
+    let blockSize  = 16
+    let numBlocks  = (seqLen + blockSize - 1) / blockSize
+    let poolSize   = numBlocks * blockSize
+
+    let Q = (0..<seqLen * numHeads * headDim).map { _ in Float.random(in: -1...1) }
+    let K_pool = (0..<poolSize * numKVHeads * headDim).map { _ in Float.random(in: -1...1) }
+    let V_pool = (0..<poolSize * numKVHeads * headDim).map { _ in Float.random(in: -1...1) }
+    var blockTable = [Int32](repeating: 0, count: numBlocks)
+    for i in 0..<numBlocks { blockTable[i] = Int32(i) }
+
+    func cpuGQA() -> [Float] {
+        let scale = 1.0 / sqrt(Float(headDim))
+        var O = [Float](repeating: 0, count: seqLen * numHeads * headDim)
+        for h in 0..<numHeads {
+            let kvH = h / (numHeads / numKVHeads)
+            for i in 0..<seqLen {
+                var m = -Float.infinity, l: Float = 0
+                var acc = [Float](repeating: 0, count: headDim)
+                for lb in 0..<numBlocks {
+                    let pb = Int(blockTable[lb])
+                    for lj in 0..<blockSize {
+                        let gj = lb * blockSize + lj
+                        if gj >= seqLen { break }
+                        var dot: Float = 0
+                        for d in 0..<headDim {
+                            let qIdx = (i * numHeads + h) * headDim + d
+                            let kIdx = (pb * blockSize + lj) * numKVHeads * headDim + kvH * headDim + d
+                            dot += Q[qIdx] * K_pool[kIdx]
+                        }
+                        dot *= scale
+                        let mOld = m; m = max(m, dot)
+                        let corr = exp(mOld - m)
+                        l = l * corr + exp(dot - m)
+                        for d in 0..<headDim {
+                            let vIdx = (pb * blockSize + lj) * numKVHeads * headDim + kvH * headDim + d
+                            acc[d] = acc[d] * corr + exp(dot - m) * V_pool[vIdx]
+                        }
+                    }
+                }
+                for d in 0..<headDim {
+                    O[(i * numHeads + h) * headDim + d] = acc[d] / l
+                }
+            }
+        }
+        return O
+    }
+    let expected = cpuGQA()
+
+    let engine = try! PagedAttentionEngine()
+    let bufQ   = makeBuffer(from: Q)
+    let bufK   = makeBuffer(from: K_pool)
+    let bufV   = makeBuffer(from: V_pool)
+    let bufBT  = makeBuffer(from: blockTable)
+    let bufO   = device.makeBuffer(
+        length: seqLen * numHeads * headDim * MemoryLayout<Float>.stride,
+        options: .storageModeShared)!
+
+    engine.forward(
+        q: bufQ, kPool: bufK, vPool: bufV, blockTable: bufBT,
+        seqLen: seqLen, headDim: headDim,
+        numHeads: numHeads, numKVHeads: numKVHeads,
+        numBlocks: numBlocks, blockSize: blockSize,
+        output: bufO
+    )
+
+    let result = readFloats(from: bufO, count: seqLen * numHeads * headDim)
+    var maxDiff: Float = 0
+    for i in 0..<result.count { maxDiff = max(maxDiff, abs(result[i] - expected[i])) }
+    print("Max difference from CPU reference: \(maxDiff)")
+    print(maxDiff < 1e-4 ? "✓ Grouped-query attention (GQA) verified!" : "✗ FAILED")
+}
+
 // MARK: - Entry Point
 
 import XCTest
@@ -1143,5 +1316,7 @@ final class PagedAttentionMetalTests: XCTestCase {
         runPagedAttention()
         runPagedAttentionBackward()
         runPagedAttentionV2()
+        runMultiHeadPagedAttention()
+        runGroupedQueryAttention()
     }
 }

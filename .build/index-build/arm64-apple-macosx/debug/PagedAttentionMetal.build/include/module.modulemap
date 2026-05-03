@@ -1,3 +1,0 @@
-module PagedAttentionMetal {
-    header "/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetal.build/include/PagedAttentionMetal-Swift.h"
-}

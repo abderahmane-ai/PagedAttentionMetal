@@ -1,0 +1,32 @@
+# Build artifacts
+.build/
+.swiftpm/
+*.o
+*.d
+*.metallib
+*.air
+*.dia
+
+# DerivedData (Xcode)
+DerivedData/
+
+# Example app build artifacts
+ExampleApp/.build/
+ExampleApp/.swiftpm/
+
+# Xcode project files (auto-generated)
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+
+# Resolved package snapshots (commit Package.resolved for apps, not libraries)
+Package.resolved
+
+# macOS metadata
+.DS_Store
+**/.DS_Store
+
+# Python cache (Reference/)
+__pycache__/
+*.pyc
+*.pyo

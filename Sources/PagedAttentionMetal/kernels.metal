@@ -358,6 +358,10 @@ kernel void flash_attention_forward(
 
 // MARK: - Paged Attention (Phase 7)
 
+// Q layout:      [seq_len, num_heads, head_dim]
+// K/V pool layout: [num_physical_blocks, block_size, num_kv_heads, head_dim]
+// Output layout: [seq_len, num_heads, head_dim]
+// Grid:          (width=num_q_tiles, height=seq_len/block_size, depth=num_heads)
 kernel void paged_attention_single(
     device const float   *Q            [[buffer(0)]],
     device const float   *K_pool       [[buffer(1)]],
@@ -366,9 +370,11 @@ kernel void paged_attention_single(
     device       float   *O            [[buffer(4)]],
     constant uint        &seq_len      [[buffer(5)]],
     constant uint        &head_dim     [[buffer(6)]],
+    constant uint        &num_heads    [[buffer(7)]],
+    constant uint        &num_kv_heads [[buffer(8)]],
 
-    uint2  gid              [[threadgroup_position_in_grid]],
-    uint2  lid              [[thread_position_in_threadgroup]],
+    uint3  gid              [[threadgroup_position_in_grid]],
+    uint3  lid              [[thread_position_in_threadgroup]],
 
     threadgroup float *Q_tile   [[threadgroup(0)]],
     threadgroup float *K_tile   [[threadgroup(1)]],
@@ -377,6 +383,8 @@ kernel void paged_attention_single(
     const uint row_in_tile = lid.y;
     const uint col         = lid.x;
     const uint row         = gid.y * BLOCK_SIZE + row_in_tile;
+    const uint head_idx    = gid.z;
+    const uint kv_head_idx = head_idx / (num_heads / num_kv_heads);
 
     const float scale = 1.0f / sqrt(float(head_dim));
 
@@ -386,7 +394,7 @@ kernel void paged_attention_single(
 
     // Guard against out-of-bounds access for misaligned sequences
     if (row < seq_len && col < head_dim) {
-        Q_tile[row_in_tile * head_dim + col] = Q[row * head_dim + col];
+        Q_tile[row_in_tile * head_dim + col] = Q[(row * num_heads + head_idx) * head_dim + col];
     } else if (row_in_tile < BLOCK_SIZE && col < head_dim) {
         Q_tile[row_in_tile * head_dim + col] = 0.0f;
     }
@@ -396,15 +404,16 @@ kernel void paged_attention_single(
         int logical_block = k_block / BLOCK_SIZE;
         int physical_block = block_table[logical_block];
 
-        device const float* K_block_base = K_pool + physical_block * BLOCK_SIZE * head_dim;
-        device const float* V_block_base = V_pool + physical_block * BLOCK_SIZE * head_dim;
+        // Base of this physical block across all KV heads
+        device const float* K_block_base = K_pool + physical_block * BLOCK_SIZE * num_kv_heads * head_dim;
+        device const float* V_block_base = V_pool + physical_block * BLOCK_SIZE * num_kv_heads * head_dim;
 
         uint local_k_row = lid.y;
         uint global_k_row = k_block + local_k_row;
 
         if (global_k_row < seq_len && col < head_dim) {
-            K_tile[local_k_row * head_dim + col] = K_block_base[local_k_row * head_dim + col];
-            V_tile[local_k_row * head_dim + col] = V_block_base[local_k_row * head_dim + col];
+            K_tile[local_k_row * head_dim + col] = K_block_base[local_k_row * num_kv_heads * head_dim + kv_head_idx * head_dim + col];
+            V_tile[local_k_row * head_dim + col] = V_block_base[local_k_row * num_kv_heads * head_dim + kv_head_idx * head_dim + col];
         } else {
             K_tile[local_k_row * head_dim + col] = 0.0f;
             V_tile[local_k_row * head_dim + col] = 0.0f;
@@ -416,7 +425,7 @@ kernel void paged_attention_single(
                 uint global_key_idx = k_block + local_j;
                 if (global_key_idx >= seq_len) continue;
 
-                // SIMD vectorized dot product
+                // SIMD vectorized dot product over the tile
                 float dot = simd_dot_tile(
                     Q_tile, row_in_tile * head_dim,
                     K_tile, local_j * head_dim,
@@ -436,7 +445,7 @@ kernel void paged_attention_single(
     }
 
     if (row < seq_len && col < head_dim) {
-        O[row * head_dim + col] = acc_o / l_i;
+        O[(row * num_heads + head_idx) * head_dim + col] = acc_o / l_i;
     }
 }
 
@@ -529,113 +538,6 @@ kernel void paged_attention_backward(
     dQ[i * head_dim + d] = dQ_acc;
 }
 
-// MARK: - Half Precision K/V Kernel (Optional)
-
-kernel void paged_attention_half(
-    device const float   *Q            [[buffer(0)]],
-    device const half   *K_pool       [[buffer(1)]],
-    device const half   *V_pool       [[buffer(2)]],
-    device const int     *block_table  [[buffer(3)]],
-    device       float   *O            [[buffer(4)]],
-    constant uint        &seq_len      [[buffer(5)]],
-    constant uint        &head_dim     [[buffer(6)]],
-
-    uint2  gid              [[threadgroup_position_in_grid]],
-    uint2  lid              [[thread_position_in_threadgroup]],
-
-    threadgroup float *Q_tile   [[threadgroup(0)]],
-    threadgroup float *K_tile   [[threadgroup(1)]],
-    threadgroup float *V_tile   [[threadgroup(2)]]
-) {
-    const uint row_in_tile = lid.y;
-    const uint col         = lid.x;
-    const uint row         = gid.y * BLOCK_SIZE + row_in_tile;
-
-    const float scale = 1.0f / sqrt(float(head_dim));
-
-    float m_i   = -INFINITY;
-    float l_i   = 0.0f;
-    float acc_o = 0.0f;
-
-    if (row < seq_len && col < head_dim) {
-        Q_tile[row_in_tile * head_dim + col] = Q[row * head_dim + col];
-    } else {
-        Q_tile[row_in_tile * head_dim + col] = 0.0f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint k_block = 0; k_block < seq_len; k_block += BLOCK_SIZE) {
-        int logical_block = k_block / BLOCK_SIZE;
-        int physical_block = block_table[logical_block];
-
-        device const half* K_block_base = K_pool + physical_block * BLOCK_SIZE * head_dim;
-        device const half* V_block_base = V_pool + physical_block * BLOCK_SIZE * head_dim;
-
-        uint local_k_row = lid.y;
-        uint global_k_row = k_block + local_k_row;
-
-        if (global_k_row < seq_len && col < head_dim) {
-            K_tile[local_k_row * head_dim + col] = float(K_block_base[local_k_row * head_dim + col]);
-            V_tile[local_k_row * head_dim + col] = float(V_block_base[local_k_row * head_dim + col]);
-        } else {
-            K_tile[local_k_row * head_dim + col] = 0.0f;
-            V_tile[local_k_row * head_dim + col] = 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (row < seq_len && col < head_dim) {
-            for (uint local_j = 0; local_j < BLOCK_SIZE; local_j++) {
-                uint global_key_idx = k_block + local_j;
-                if (global_key_idx >= seq_len) continue;
-
-                float dot = simd_dot_tile(
-                    Q_tile, row_in_tile * head_dim,
-                    K_tile, local_j * head_dim,
-                    head_dim
-                );
-                dot *= scale;
-
-                float m_old = m_i;
-                m_i = max(m_i, dot);
-                float correction = exp(m_old - m_i);
-                l_i = l_i * correction + exp(dot - m_i);
-                acc_o = acc_o * correction;
-                acc_o += exp(dot - m_i) * V_tile[local_j * head_dim + col];
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    if (row < seq_len && col < head_dim) {
-        O[row * head_dim + col] = acc_o / l_i;
-    }
-}
-
-// MARK: - KV Cache Copy Kernel
-
-kernel void kv_cache_copy(
-    device const half *src_pool   [[buffer(0)]],
-    device half       *dst_pool   [[buffer(1)]],
-    device const int *copy_pairs [[buffer(2)]],
-    constant uint    &num_pairs   [[buffer(3)]],
-    constant uint    &block_size [[buffer(4)]],
-    constant uint    &head_dim   [[buffer(5)]],
-    uint id [[thread_position_in_grid]]
-) {
-    // Bounds check to prevent out-of-bounds access on final reduction
-    if (id >= num_pairs) return;
-
-    int src_block = copy_pairs[id * 2];
-    int dst_block = copy_pairs[id * 2 + 1];
-
-    device const half* src = src_pool + src_block * block_size * head_dim;
-    device half* dst = dst_pool + dst_block * block_size * head_dim;
-
-    for (uint i = 0; i < block_size * head_dim; i++) {
-        dst[i] = src[i];
-    }
-}
-
 // MARK: - Paged Attention V2 (Two-Pass)
 
 kernel void paged_attention_split_phase1(
@@ -649,16 +551,22 @@ kernel void paged_attention_split_phase1(
     constant uint      &seq_len       [[buffer(7)]],
     constant uint      &head_dim      [[buffer(8)]],
     constant uint      &num_blocks    [[buffer(9)]],
-    uint2 gid [[thread_position_in_grid]]
+    constant uint      &num_heads     [[buffer(10)]],
+    constant uint      &num_kv_heads  [[buffer(11)]],
+    uint3 gid [[thread_position_in_grid]]
 ) {
-    const uint row = gid.y;
+    const uint row       = gid.y;
     const uint block_idx = gid.x;
+    const uint head_idx  = gid.z;
 
-    if (row >= seq_len || block_idx >= num_blocks) return;
+    if (row >= seq_len || block_idx >= num_blocks || head_idx >= num_heads) return;
+
+    const uint kv_head_idx = head_idx / (num_heads / num_kv_heads);
 
     int physical_block = block_table[block_idx];
-    device const float* K_block = K_pool + physical_block * BLOCK_SIZE * head_dim;
-    device const float* V_block = V_pool + physical_block * BLOCK_SIZE * head_dim;
+    // K/V pool layout: [num_physical_blocks, block_size, num_kv_heads, head_dim]
+    device const float* K_block = K_pool + physical_block * BLOCK_SIZE * num_kv_heads * head_dim;
+    device const float* V_block = V_pool + physical_block * BLOCK_SIZE * num_kv_heads * head_dim;
 
     const float scale = 1.0f / sqrt(float(head_dim));
 
@@ -671,20 +579,25 @@ kernel void paged_attention_split_phase1(
         uint global_j = block_idx * BLOCK_SIZE + local_j;
         if (global_j >= seq_len) break;
 
-        float dot = simd_dot_product(Q + row * head_dim, K_block + local_j * head_dim, head_dim);
+        device const float* K_token = K_block + local_j * num_kv_heads * head_dim + kv_head_idx * head_dim;
+        device const float* V_token = V_block + local_j * num_kv_heads * head_dim + kv_head_idx * head_dim;
+
+        // Q layout: [seq_len, num_heads, head_dim]
+        float dot = simd_dot_product(Q + (row * num_heads + head_idx) * head_dim, K_token, head_dim);
         dot *= scale;
 
         float m_old = m_i;
         m_i = max(m_i, dot);
         float correction = exp(m_old - m_i);
         l_i = l_i * correction + exp(dot - m_i);
-        
+
         for (uint d = 0; d < head_dim; d++) {
-            acc_o[d] = acc_o[d] * correction + exp(dot - m_i) * V_block[local_j * head_dim + d];
+            acc_o[d] = acc_o[d] * correction + exp(dot - m_i) * V_token[d];
         }
     }
 
-    uint partial_idx = row * num_blocks + block_idx;
+    // Partial tensors layout: [num_heads, seq_len, num_blocks]
+    uint partial_idx = (head_idx * seq_len + row) * num_blocks + block_idx;
     partial_m[partial_idx] = m_i;
     partial_l[partial_idx] = l_i;
     for (uint d = 0; d < head_dim; d++) {
@@ -700,19 +613,22 @@ kernel void paged_attention_split_phase2(
     constant uint      &seq_len       [[buffer(4)]],
     constant uint      &head_dim      [[buffer(5)]],
     constant uint      &num_blocks    [[buffer(6)]],
-    uint2 gid [[thread_position_in_grid]]
+    constant uint      &num_heads     [[buffer(7)]],
+    uint3 gid [[thread_position_in_grid]]
 ) {
-    const uint row = gid.y;
-    const uint col = gid.x;
+    const uint row      = gid.y;
+    const uint col      = gid.x;
+    const uint head_idx = gid.z;
 
-    if (row >= seq_len || col >= head_dim) return;
+    if (row >= seq_len || col >= head_dim || head_idx >= num_heads) return;
 
     float global_m = -INFINITY;
     float global_l = 0.0f;
     float global_acc = 0.0f;
 
     for (uint block_idx = 0; block_idx < num_blocks; block_idx++) {
-        uint partial_idx = row * num_blocks + block_idx;
+        // Partial tensors layout: [num_heads, seq_len, num_blocks]
+        uint partial_idx = (head_idx * seq_len + row) * num_blocks + block_idx;
         float p_m = partial_m[partial_idx];
         float p_l = partial_l[partial_idx];
         float p_out = partial_out[partial_idx * head_dim + col];
@@ -722,10 +638,11 @@ kernel void paged_attention_split_phase2(
         float m_old = global_m;
         global_m = max(global_m, p_m);
         float correction = exp(m_old - global_m);
-        
+
         global_l = global_l * correction + p_l * exp(p_m - global_m);
         global_acc = global_acc * correction + p_out * exp(p_m - global_m);
     }
 
-    O[row * head_dim + col] = global_acc / global_l;
+    // Output layout: [seq_len, num_heads, head_dim]
+    O[(row * num_heads + head_idx) * head_dim + col] = global_acc / global_l;
 }

@@ -67,16 +67,21 @@ public class PagedAttentionEngine {
     
     /// Executes the forward attention pass directly on the GPU.
     ///
+    /// Automatically dispatches to the single-pass kernel for short sequences and
+    /// the V2 Split-K Map-Reduce kernel for sequences longer than `splitThreshold`.
+    ///
     /// - Parameters:
-    ///   - q: A contiguous buffer containing the query vectors (`Float`).
-    ///   - kPool: The pre-allocated KV pool buffer storing Key vectors (`Float`).
-    ///   - vPool: The pre-allocated KV pool buffer storing Value vectors (`Float`).
-    ///   - blockTable: The virtual memory mapping matching logical sequence blocks to physical blocks (`Int32`).
-    ///   - seqLen: The logical sequence length (context window).
-    ///   - headDim: The vector dimension of each attention head.
-    ///   - numBlocks: The total number of physical KV blocks allocated in the pool.
-    ///   - blockSize: The number of tokens stored inside each physical memory block. Default is 16.
-    ///   - output: The destination buffer where the final attention matrix will be written (`Float`).
+    ///   - q: Query buffer — layout `[seq_len, num_heads, head_dim]` (`Float`).
+    ///   - kPool: Key cache pool — layout `[num_blocks, block_size, num_kv_heads, head_dim]` (`Float`).
+    ///   - vPool: Value cache pool — same layout as `kPool` (`Float`).
+    ///   - blockTable: Virtual memory mapping from logical blocks to physical blocks (`Int32`).
+    ///   - seqLen: Logical sequence length (context window).
+    ///   - headDim: Vector dimension of each attention head.
+    ///   - numHeads: Number of query heads. All heads are dispatched in parallel on the GPU.
+    ///   - numKVHeads: Number of key/value heads. Set equal to `numHeads` for MHA, 1 for MQA, or any divisor for GQA.
+    ///   - numBlocks: Total number of physical KV blocks allocated in the pool.
+    ///   - blockSize: Tokens stored per physical block. Default is 16.
+    ///   - output: Destination buffer — layout `[seq_len, num_heads, head_dim]` (`Float`).
     public func forward(
         q: MTLBuffer,
         kPool: MTLBuffer,
@@ -84,73 +89,91 @@ public class PagedAttentionEngine {
         blockTable: MTLBuffer,
         seqLen: Int,
         headDim: Int,
+        numHeads: Int,
+        numKVHeads: Int,
         numBlocks: Int,
         blockSize: Int = 16,
         output: MTLBuffer
     ) {
         if seqLen <= splitThreshold {
             forwardSinglePass(
-                q: q, kPool: kPool, vPool: vPool, blockTable: blockTable, 
-                seqLen: seqLen, headDim: headDim, blockSize: blockSize, output: output
+                q: q, kPool: kPool, vPool: vPool, blockTable: blockTable,
+                seqLen: seqLen, headDim: headDim, numHeads: numHeads, numKVHeads: numKVHeads,
+                blockSize: blockSize, output: output
             )
         } else {
             forwardSplitPass(
-                q: q, kPool: kPool, vPool: vPool, blockTable: blockTable, 
-                seqLen: seqLen, headDim: headDim, numBlocks: numBlocks, blockSize: blockSize, output: output
+                q: q, kPool: kPool, vPool: vPool, blockTable: blockTable,
+                seqLen: seqLen, headDim: headDim, numHeads: numHeads, numKVHeads: numKVHeads,
+                numBlocks: numBlocks, blockSize: blockSize, output: output
             )
         }
     }
-    
+
     private func forwardSinglePass(
         q: MTLBuffer, kPool: MTLBuffer, vPool: MTLBuffer, blockTable: MTLBuffer,
-        seqLen: Int, headDim: Int, blockSize: Int, output: MTLBuffer
+        seqLen: Int, headDim: Int, numHeads: Int, numKVHeads: Int, blockSize: Int, output: MTLBuffer
     ) {
         guard let cb = commandQueue.makeCommandBuffer(),
               let enc = cb.makeComputeCommandEncoder() else { return }
-        
+
         enc.setComputePipelineState(singlePassPipeline)
         enc.setBuffer(q, offset: 0, index: 0)
         enc.setBuffer(kPool, offset: 0, index: 1)
         enc.setBuffer(vPool, offset: 0, index: 2)
         enc.setBuffer(blockTable, offset: 0, index: 3)
         enc.setBuffer(output, offset: 0, index: 4)
-        
-        var seqLenVar = UInt32(seqLen)
-        var headDimVar = UInt32(headDim)
-        enc.setBytes(&seqLenVar, length: MemoryLayout<UInt32>.stride, index: 5)
-        enc.setBytes(&headDimVar, length: MemoryLayout<UInt32>.stride, index: 6)
-        
+
+        var seqLenVar    = UInt32(seqLen)
+        var headDimVar   = UInt32(headDim)
+        var numHeadsVar  = UInt32(numHeads)
+        var numKVVar     = UInt32(numKVHeads)
+        enc.setBytes(&seqLenVar,   length: 4, index: 5)
+        enc.setBytes(&headDimVar,  length: 4, index: 6)
+        enc.setBytes(&numHeadsVar, length: 4, index: 7)
+        enc.setBytes(&numKVVar,    length: 4, index: 8)
+
         let tileMemSize = blockSize * headDim * MemoryLayout<Float>.stride
         enc.setThreadgroupMemoryLength(tileMemSize, index: 0)
         enc.setThreadgroupMemoryLength(tileMemSize, index: 1)
         enc.setThreadgroupMemoryLength(tileMemSize, index: 2)
-        
-        let numQTiles = (seqLen + blockSize - 1) / blockSize
+
+        let numQTiles   = (seqLen + blockSize - 1) / blockSize
         let threadsPerTG = MTLSize(width: headDim, height: blockSize, depth: 1)
-        let threadgroups = MTLSize(width: 1, height: numQTiles, depth: 1)
-        
+        // depth = numHeads: all heads execute in parallel
+        let threadgroups = MTLSize(width: 1, height: numQTiles, depth: numHeads)
+
         enc.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerTG)
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()
     }
-    
+
     private func forwardSplitPass(
         q: MTLBuffer, kPool: MTLBuffer, vPool: MTLBuffer, blockTable: MTLBuffer,
-        seqLen: Int, headDim: Int, numBlocks: Int, blockSize: Int, output: MTLBuffer
+        seqLen: Int, headDim: Int, numHeads: Int, numKVHeads: Int,
+        numBlocks: Int, blockSize: Int, output: MTLBuffer
     ) {
-        // Allocate intermediate buffers for Phase 1
-        let partialOut = device.makeBuffer(length: seqLen * numBlocks * headDim * MemoryLayout<Float>.stride, options: .storageModePrivate)!
-        let partialM = device.makeBuffer(length: seqLen * numBlocks * MemoryLayout<Float>.stride, options: .storageModePrivate)!
-        let partialL = device.makeBuffer(length: seqLen * numBlocks * MemoryLayout<Float>.stride, options: .storageModePrivate)!
-        
+        // Intermediate buffers sized for all heads: [num_heads, seq_len, num_blocks, ...]
+        let partialOut = device.makeBuffer(
+            length: numHeads * seqLen * numBlocks * headDim * MemoryLayout<Float>.stride,
+            options: .storageModePrivate)!
+        let partialM = device.makeBuffer(
+            length: numHeads * seqLen * numBlocks * MemoryLayout<Float>.stride,
+            options: .storageModePrivate)!
+        let partialL = device.makeBuffer(
+            length: numHeads * seqLen * numBlocks * MemoryLayout<Float>.stride,
+            options: .storageModePrivate)!
+
         guard let cb = commandQueue.makeCommandBuffer() else { return }
-        
-        var seqLenVar = UInt32(seqLen)
-        var headDimVar = UInt32(headDim)
+
+        var seqLenVar    = UInt32(seqLen)
+        var headDimVar   = UInt32(headDim)
         var numBlocksVar = UInt32(numBlocks)
-        
-        // --- Phase 1 ---
+        var numHeadsVar  = UInt32(numHeads)
+        var numKVVar     = UInt32(numKVHeads)
+
+        // --- Phase 1: per-block partial attention (parallelized across heads via depth) ---
         let enc1 = cb.makeComputeCommandEncoder()!
         enc1.setComputePipelineState(splitPhase1Pipeline)
         enc1.setBuffer(q, offset: 0, index: 0)
@@ -160,31 +183,34 @@ public class PagedAttentionEngine {
         enc1.setBuffer(partialOut, offset: 0, index: 4)
         enc1.setBuffer(partialM, offset: 0, index: 5)
         enc1.setBuffer(partialL, offset: 0, index: 6)
-        enc1.setBytes(&seqLenVar, length: 4, index: 7)
-        enc1.setBytes(&headDimVar, length: 4, index: 8)
+        enc1.setBytes(&seqLenVar,    length: 4, index: 7)
+        enc1.setBytes(&headDimVar,   length: 4, index: 8)
         enc1.setBytes(&numBlocksVar, length: 4, index: 9)
-        
-        let grid1 = MTLSize(width: numBlocks, height: seqLen, depth: 1)
+        enc1.setBytes(&numHeadsVar,  length: 4, index: 10)
+        enc1.setBytes(&numKVVar,     length: 4, index: 11)
+
+        let grid1   = MTLSize(width: numBlocks, height: seqLen, depth: numHeads)
         let tgroup1 = MTLSize(width: 1, height: 1, depth: 1)
         enc1.dispatchThreads(grid1, threadsPerThreadgroup: tgroup1)
         enc1.endEncoding()
-        
-        // --- Phase 2 ---
+
+        // --- Phase 2: global Online Safe Softmax reduction across all blocks ---
         let enc2 = cb.makeComputeCommandEncoder()!
         enc2.setComputePipelineState(splitPhase2Pipeline)
         enc2.setBuffer(partialOut, offset: 0, index: 0)
         enc2.setBuffer(partialM, offset: 0, index: 1)
         enc2.setBuffer(partialL, offset: 0, index: 2)
         enc2.setBuffer(output, offset: 0, index: 3)
-        enc2.setBytes(&seqLenVar, length: 4, index: 4)
-        enc2.setBytes(&headDimVar, length: 4, index: 5)
+        enc2.setBytes(&seqLenVar,    length: 4, index: 4)
+        enc2.setBytes(&headDimVar,   length: 4, index: 5)
         enc2.setBytes(&numBlocksVar, length: 4, index: 6)
-        
-        let grid2 = MTLSize(width: headDim, height: seqLen, depth: 1)
+        enc2.setBytes(&numHeadsVar,  length: 4, index: 7)
+
+        let grid2   = MTLSize(width: headDim, height: seqLen, depth: numHeads)
         let tgroup2 = MTLSize(width: headDim, height: 1, depth: 1)
         enc2.dispatchThreads(grid2, threadsPerThreadgroup: tgroup2)
         enc2.endEncoding()
-        
+
         cb.commit()
         cb.waitUntilCompleted()
     }
