@@ -6,6 +6,7 @@
 *.metallib
 *.air
 *.dia
+*.profraw
 
 # DerivedData (Xcode)
 DerivedData/

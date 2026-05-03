@@ -192,3 +192,156 @@ public class KVCacheManager {
         return freeBlocks.count
     }
 }
+
+
+// MARK: - Batch KV Cache Manager
+
+/// Manages KV cache for multiple concurrent sequences with batch processing support.
+public class BatchKVCacheManager {
+    public let device: MTLDevice
+    public let maxBatchSize: Int
+    public let maxSequenceBlocks: Int
+    public let blockSize: Int
+    public let headDim: Int
+    public let numKVHeads: Int
+    public let dataType: PagedAttentionDataType
+    public let maxBlocks: Int
+    
+    public let kPoolBuffer: MTLBuffer
+    public let vPoolBuffer: MTLBuffer
+    
+    private var freeBlocks: [Int32]
+    private var sequences: [Int: LogicalSequence] = [:]
+    
+    public init(
+        device: MTLDevice,
+        maxBatchSize: Int,
+        maxSequenceBlocks: Int,
+        maxBlocks: Int,
+        blockSize: Int = 16,
+        headDim: Int,
+        numKVHeads: Int,
+        dataType: PagedAttentionDataType = .float16
+    ) {
+        self.device = device
+        self.maxBatchSize = maxBatchSize
+        self.maxSequenceBlocks = maxSequenceBlocks
+        self.maxBlocks = maxBlocks
+        self.blockSize = blockSize
+        self.headDim = headDim
+        self.numKVHeads = numKVHeads
+        self.dataType = dataType
+        
+        let stride = (dataType == .float16) ? MemoryLayout<Float16>.stride : MemoryLayout<Float>.stride
+        let poolBytes = maxBlocks * blockSize * numKVHeads * headDim * stride
+        
+        self.kPoolBuffer = device.makeBuffer(length: poolBytes, options: .storageModeShared)!
+        self.vPoolBuffer = device.makeBuffer(length: poolBytes, options: .storageModeShared)!
+        
+        self.freeBlocks = (0..<Int32(maxBlocks)).reversed()
+    }
+    
+    public func allocateSequence(id: Int) throws {
+        guard sequences[id] == nil else {
+            throw KVCacheError.sequenceAlreadyExists
+        }
+        sequences[id] = LogicalSequence(id: id)
+    }
+    
+    public func appendTokens(toSequence id: Int, count: Int) throws {
+        guard var sequence = sequences[id] else {
+            throw KVCacheError.sequenceNotFound
+        }
+        
+        let currentLen = sequence.sequenceLength
+        let newLen = currentLen + count
+        
+        let blocksNeededNow = (currentLen + blockSize - 1) / blockSize
+        let blocksNeededAfter = (newLen + blockSize - 1) / blockSize
+        
+        let additionalBlocksRequired = blocksNeededAfter - blocksNeededNow
+        
+        if additionalBlocksRequired > 0 {
+            guard freeBlocks.count >= additionalBlocksRequired else {
+                throw KVCacheError.outOfMemory
+            }
+            
+            for _ in 0..<additionalBlocksRequired {
+                let physicalBlockId = freeBlocks.removeLast()
+                sequence.blockTable.append(physicalBlockId)
+            }
+        }
+        
+        sequence.sequenceLength = newLen
+        sequences[id] = sequence
+    }
+    
+    public func freeSequence(id: Int) {
+        if let sequence = sequences.removeValue(forKey: id) {
+            for blockId in sequence.blockTable {
+                freeBlocks.append(blockId)
+            }
+        }
+    }
+    
+    public func getSequence(id: Int) throws -> LogicalSequence {
+        guard let sequence = sequences[id] else {
+            throw KVCacheError.sequenceNotFound
+        }
+        return sequence
+    }
+    
+    /// Returns a flat [batchSize × maxSequenceBlocks] MTLBuffer for GPU dispatch
+    public func getBatchBlockTableBuffer(forBatch ids: [Int]) throws -> MTLBuffer {
+        guard ids.count <= maxBatchSize else {
+            throw KVCacheError.outOfMemory
+        }
+        
+        var flatTable = [Int32](repeating: 0, count: ids.count * maxSequenceBlocks)
+        
+        for (batchIdx, seqId) in ids.enumerated() {
+            guard let sequence = sequences[seqId] else {
+                throw KVCacheError.sequenceNotFound
+            }
+            
+            let offset = batchIdx * maxSequenceBlocks
+            for (blockIdx, physicalBlock) in sequence.blockTable.enumerated() {
+                if blockIdx < maxSequenceBlocks {
+                    flatTable[offset + blockIdx] = physicalBlock
+                }
+            }
+        }
+        
+        return flatTable.withUnsafeBytes { ptr in
+            device.makeBuffer(
+                bytes: ptr.baseAddress!,
+                length: flatTable.count * MemoryLayout<Int32>.stride,
+                options: .storageModeShared
+            )!
+        }
+    }
+    
+    /// Returns [batchSize] MTLBuffer of current sequence lengths
+    public func getSeqLengthsBuffer(forBatch ids: [Int]) throws -> MTLBuffer {
+        var lengths = [UInt32]()
+        
+        for seqId in ids {
+            guard let sequence = sequences[seqId] else {
+                throw KVCacheError.sequenceNotFound
+            }
+            lengths.append(UInt32(sequence.sequenceLength))
+        }
+        
+        return lengths.withUnsafeBytes { ptr in
+            device.makeBuffer(
+                bytes: ptr.baseAddress!,
+                length: lengths.count * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared
+            )!
+        }
+    }
+    
+    public var availableBlocks: Int {
+        return freeBlocks.count
+    }
+}

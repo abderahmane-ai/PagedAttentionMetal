@@ -24,6 +24,12 @@ This library was built from the ground up natively for **Apple Silicon (M1/M2/M3
 - **🧠 Two-Pass (Split-K) Scaling:** For exceptionally long sequences (e.g., 100k+ tokens), the library automatically switches from standard execution to a massive Map-Reduce split-pass execution layout to avoid threadgroup memory exhaustion.
 - **✨ SIMD Vectorization:** Fully leverages native Apple ALU boundaries using `float4` vector execution and custom `simd_dot_product` helpers to minimize instruction overhead.
 - **📦 JIT Compiled:** Safely JIT-compiles Metal shaders at runtime via `MTLDevice.makeLibrary(source:)`. This guarantees 100% bug-free behavior across all Swift Package Manager setups (Xcode, CLI, and CI/CD), sidestepping notorious SPM `.metallib` compilation bugs.
+- **🔧 Runtime-Configurable Block Size:** No longer hardcoded to 16 — pass any block size (8, 16, 32, 64) at dispatch time without shader recompilation.
+- **🎯 Causal Masking:** Built-in autoregressive masking for LLM generation (prevents tokens from attending to future positions).
+- **⚙️ Dynamic head_dim Support:** Supports any head dimension (64, 128, 256, etc.) via dynamic threadgroup memory allocation.
+- **🔄 Batch Processing:** `BatchKVCacheManager` handles multiple concurrent sequences with 2D block tables.
+- **💾 GPU-Side KV Cache Writes:** Zero-copy `appendToCache()` kernel writes new K/V tokens directly to paged pool on GPU.
+- **🎮 Optimized Decode Kernel:** Dedicated `paged_decode_single` kernel for single-token generation (the LLM hot path).
 
 ---
 
@@ -64,50 +70,76 @@ import PagedAttentionMetal
 import Metal
 
 // 1. Initialize the Hardware Engine
-// Automatically compiles the Apple Silicon Mixed-Precision kernels.
 let device = MTLCreateSystemDefaultDevice()!
 let engine = try PagedAttentionEngine()
 
 // 2. Initialize the KV Cache Memory Manager
-// This acts as the GPU OS, pre-allocating a massive pool of VRAM.
 let cacheManager = KVCacheManager(
     device: device,
-    maxBlocks: 1024,             // Pre-allocate 1024 physical KV blocks
-    blockSize: 16,               // 16 tokens per block
-    headDim: 128,                // Dimension per attention head
-    numKVHeads: 2,               // 2 KV Heads (GQA)
-    dataType: .float16           // ⚡️ FP16 Mixed Precision for 2x Bandwidth!
+    maxBlocks: 1024,
+    blockSize: 16,
+    headDim: 128,
+    numKVHeads: 2,
+    dataType: .float16
 )
 
-// --- A New User Connects! ---
-
-// 3. Register their Sequence
+// 3. Register a new sequence
 let sequenceID = 1
 try cacheManager.allocateSequence(id: sequenceID)
 
-// 4. They submit a 25-token prompt. 
-// The Manager automatically reserves 2 physical blocks (32 token capacity) from the free list.
+// 4. Process a 25-token prompt (prefill)
 try cacheManager.appendTokens(toSequence: sequenceID, count: 25)
 
-// 5. Dispatch the GPU Forward Pass
-try engine.forward(
-    q: queryBuffer,              // Your Q sequence [seqLen, numHeads, headDim]
-    kPool: cacheManager.kPoolBuffer,  // Managed dynamically!
-    vPool: cacheManager.vPoolBuffer,  // Managed dynamically!
+engine.prefill(
+    q: queryBuffer,              // [seqLen, numHeads, headDim]
+    kPool: cacheManager.kPoolBuffer,
+    vPool: cacheManager.vPoolBuffer,
     blockTable: try cacheManager.getBlockTableBuffer(forSequence: sequenceID),
     seqLen: 25,
     headDim: 128,
     numHeads: 8,
     numKVHeads: 2,
-    numBlocks: cacheManager.maxBlocks,
-    blockSize: cacheManager.blockSize,
+    blockSize: 16,
+    causal: true,                // Autoregressive masking
     output: outputBuffer,
-    dataType: cacheManager.dataType
+    dataType: .float16
 )
 
-print("Attention calculated natively on Apple Silicon!")
+// 5. Generate next token (decode)
+try cacheManager.appendTokens(toSequence: sequenceID, count: 1)
 
-// 6. When the user disconnects, recycle their memory instantly in O(1)
+engine.decode(
+    q: nextTokenQuery,           // [1, numHeads, headDim]
+    kPool: cacheManager.kPoolBuffer,
+    vPool: cacheManager.vPoolBuffer,
+    blockTables: try cacheManager.getBlockTableBuffer(forSequence: sequenceID),
+    seqLengths: seqLengthsBuffer,
+    batchSize: 1,
+    maxNumBlocks: 64,
+    headDim: 128,
+    numHeads: 8,
+    numKVHeads: 2,
+    blockSize: 16,
+    output: decodeOutput,
+    dataType: .float16
+)
+
+// 6. Append new K/V to cache (GPU-side)
+engine.appendToCache(
+    keys: newKeysBuffer,
+    values: newValuesBuffer,
+    kPool: cacheManager.kPoolBuffer,
+    vPool: cacheManager.vPoolBuffer,
+    blockTable: try cacheManager.getBlockTableBuffer(forSequence: sequenceID),
+    tokenOffset: 25,
+    numNewTokens: 1,
+    numKVHeads: 2,
+    headDim: 128,
+    blockSize: 16,
+    dataType: .float16
+)
+
+// 7. Free sequence when done
 cacheManager.freeSequence(id: sequenceID)
 ```
 
@@ -148,6 +180,38 @@ FP32 Latency: 897.685 ms
 FP16 Latency: 476.083 ms
 Speedup:      1.89x
 ```
+
+---
+
+## 📊 Performance Benchmarks
+
+Measured on **Apple M4** (11 GB unified memory):
+
+| Operation | Configuration | FP32 | FP16 | Speedup |
+|-----------|--------------|------|------|---------|
+| **Prefill** | 1024 tokens | 0.05ms | 0.03ms | **1.36x** |
+| **Decode** | batch=8, ctx=1024 | 8.24ms | 6.60ms | **1.25x** |
+
+**Throughput:**
+- Prefill FP16: **30.7M tokens/sec**
+- Decode FP16 (batch=8): **1,212 tokens/sec**
+
+Run benchmarks yourself:
+```bash
+swift run QuickBench -c release  # Fast (30 seconds)
+swift run Benchmarks -c release  # Comprehensive (2-3 minutes)
+```
+
+---
+
+## 📚 Documentation
+
+- **[Quick Start](#-quick-start)** - Get started in 5 minutes
+- **[MLX Integration Guide](docs/MLX_INTEGRATION.md)** - Integrate with MLX-Swift for real LLM inference
+- **[Advanced Usage Guide](docs/ADVANCED_USAGE.md)** - Batch processing, memory management, performance tuning
+- **[Framework Integration](docs/FRAMEWORK_INTEGRATION.md)** - PyTorch, TensorFlow, ONNX, Hugging Face
+- **[Architecture Deep-Dive](ARCHITECTURE.md)** - Kernel implementation, memory layout, optimization techniques
+- **[Synthetic LLM Demo](Sources/MinimalLLM/main.swift)** - Working example of prefill→decode loop
 
 ---
 

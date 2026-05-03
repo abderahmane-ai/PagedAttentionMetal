@@ -1,0 +1,38 @@
+Name,Config,Avg(ms),Min(ms),Max(ms),Throughput(tok/s),Memory(MB)
+Prefill,seqLen=512, FP32,0.02,0.01,0.02,29163401,
+Prefill,seqLen=512, FP16,0.02,0.01,0.02,32948121,
+Prefill,seqLen=1024, FP32,0.02,0.01,0.02,59347974,
+Prefill,seqLen=1024, FP16,0.02,0.01,0.02,61286768,
+Prefill,seqLen=2048, FP32,1144.84,1127.10,1161.70,1789,
+Prefill,seqLen=2048, FP16,673.52,665.54,682.82,3041,
+Prefill,seqLen=4096, FP32,4259.00,4237.11,4287.48,962,
+Prefill,seqLen=4096, FP16,2371.28,2209.19,2433.93,1727,
+Decode,batch=1, ctx=1024, FP32,3.37,3.05,4.40,297,
+Decode,batch=1, ctx=1024, FP16,2.71,2.54,3.42,369,
+Decode,batch=4, ctx=1024, FP32,3.86,3.65,4.86,1036,
+Decode,batch=4, ctx=1024, FP16,2.94,2.72,5.18,1360,
+Decode,batch=8, ctx=1024, FP32,4.52,4.18,7.97,1769,
+Decode,batch=8, ctx=1024, FP16,3.81,3.32,6.25,2097,
+Decode,batch=16, ctx=1024, FP32,9.57,8.46,12.85,1672,
+Decode,batch=16, ctx=1024, FP16,7.83,6.87,9.45,2042,
+Decode,batch=32, ctx=1024, FP32,19.64,18.30,22.88,1629,
+Decode,batch=32, ctx=1024, FP16,12.84,12.34,13.42,2492,
+Decode,batch=1, ctx=4096, FP32,14.25,14.20,14.35,70,
+Decode,batch=1, ctx=4096, FP16,10.72,10.64,11.01,93,
+Decode,batch=8, ctx=4096, FP32,16.26,16.23,16.33,492,
+Decode,batch=8, ctx=4096, FP16,12.88,12.83,12.96,621,
+Memory (Paged),seqs=10, len=1024,0.00,0.00,0.00,,12.0
+Memory (Contiguous),seqs=10, len=1024,0.00,0.00,0.00,,20.0
+Memory (Paged),seqs=20, len=1024,0.00,0.00,0.00,,24.0
+Memory (Contiguous),seqs=20, len=1024,0.00,0.00,0.00,,40.0
+Memory (Paged),seqs=50, len=512,0.00,0.00,0.00,,30.0
+Memory (Contiguous),seqs=50, len=512,0.00,0.00,0.00,,50.0
+FP32,seqLen=1024,0.02,0.02,0.02,,2.0
+FP16,seqLen=1024,0.02,0.02,0.02,,1.0
+FP16 Speedup,seqLen=1024,0.00,0.00,0.00,1,2.0
+FP32,seqLen=2048,1848.03,1848.03,1848.03,,4.0
+FP16,seqLen=2048,771.02,771.02,771.02,,2.0
+FP16 Speedup,seqLen=2048,0.00,0.00,0.00,2,2.0
+FP32,seqLen=4096,3605.67,3605.67,3605.67,,8.0
+FP16,seqLen=4096,1963.51,1963.51,1963.51,,4.0
+FP16 Speedup,seqLen=4096,0.00,0.00,0.00,2,2.0

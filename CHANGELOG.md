@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-05-03
+
+### 🚨 BREAKING CHANGES
+- **Removed `forward()` method** — replaced with purpose-built `prefill()`, `decode()`, `appendToCache()`, and `backward()` methods
+- **API redesign** — all methods now require explicit `blockSize` parameter (no longer hardcoded to 16)
+- **Metal kernels** — removed `constant uint BLOCK_SIZE = 16`, now runtime-configurable
+
+### Added
+- **Runtime-configurable block size:** Pass any block size (8, 16, 32, 64, etc.) at dispatch time
+- **Causal masking:** All attention kernels now support `causal` flag for autoregressive generation
+- **Batch decode kernel:** `paged_decode_single` optimized for single-token generation across multiple sequences
+- **KV cache append kernels:** `kv_cache_append` for GPU-side cache writes (zero CPU memcpy)
+- **BatchKVCacheManager:** Manages 2D block tables `[batchSize × maxSequenceBlocks]` for batch processing
+- **Dynamic head_dim support:** Removed 128-dimension limit via threadgroup memory allocation
+- **Prefill method:** `prefill()` with causal masking and configurable block size
+- **Decode method:** `decode()` for batch single-token generation
+- **AppendToCache method:** `appendToCache()` for GPU-side KV cache writes
+
+### Changed
+- **Phase1 kernels:** Now use threadgroup memory for `acc_o` instead of hardcoded `float acc_o[128]` array
+- **Backward kernel:** Upgraded to 3D grid with full MHA/GQA support (`num_heads`/`num_kv_heads` parameters)
+- **Split-K phase1:** Threadgroup memory sized dynamically based on `head_dim`
+- **All kernels:** Accept `block_size` as runtime parameter instead of compile-time constant
+
+### Fixed
+- **head_dim > 128 crash:** Eliminated hardcoded 128-element stack arrays
+- **MHA backward pass:** Now correctly handles multiple heads with 3D grid dispatch
+- **Block size flexibility:** Any block size now supported without shader recompilation
+
 ## [1.0.0] - 2026-05-03
 
 ### Added
