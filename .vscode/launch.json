@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:PagedAttentionMetal}",
+            "name": "Debug PagedAttentionMLX",
+            "target": "PagedAttentionMLX",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug PagedAttentionMLX"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:PagedAttentionMetal}",
+            "name": "Release PagedAttentionMLX",
+            "target": "PagedAttentionMLX",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release PagedAttentionMLX"
+        }
+    ]
+}

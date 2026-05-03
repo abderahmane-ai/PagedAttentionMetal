@@ -1369,6 +1369,72 @@ func runGroupedQueryAttention() {
     print(maxDiff < 1e-4 ? "✓ Grouped-query attention (GQA) verified!" : "✗ FAILED")
 }
 
+// MARK: - KVCacheManager Dynamic Test
+
+func runKVCacheManagerTest() {
+    print("\n=== KVCacheManager Dynamic Allocation Test ===")
+    
+    let engine = try! PagedAttentionEngine()
+    let blockSize = 16
+    let headDim = 64
+    let numHeads = 4
+    let numKVHeads = 4
+    
+    let cacheManager = KVCacheManager(
+        device: device,
+        maxBlocks: 1024,
+        blockSize: blockSize,
+        headDim: headDim,
+        numKVHeads: numKVHeads,
+        dataType: .float32
+    )
+    
+    let initialFreeBlocks = cacheManager.availableBlocks
+    print("Initial free blocks: \(initialFreeBlocks)")
+    
+    // Allocate sequence
+    try! cacheManager.allocateSequence(id: 42)
+    
+    // Append 50 tokens
+    try! cacheManager.appendTokens(toSequence: 42, count: 50)
+    
+    let seq = try! cacheManager.getSequence(id: 42)
+    print("Sequence length: \(seq.sequenceLength)")
+    print("Allocated blocks: \(seq.blockTable.count)")
+    
+    let expectedBlocks = (50 + blockSize - 1) / blockSize
+    assert(seq.blockTable.count == expectedBlocks, "Incorrect block allocation!")
+    assert(cacheManager.availableBlocks == initialFreeBlocks - expectedBlocks, "Free list not updated!")
+    
+    // Verify we can get the MTLBuffer correctly
+    let blockTableBuffer = try! cacheManager.getBlockTableBuffer(forSequence: 42)
+    
+    let bufQ = device.makeBuffer(length: 50 * numHeads * headDim * 4, options: .storageModeShared)!
+    let bufO = device.makeBuffer(length: 50 * numHeads * headDim * 4, options: .storageModeShared)!
+    
+    // Run an empty forward pass just to ensure the buffers don't crash
+    engine.forward(
+        q: bufQ,
+        kPool: cacheManager.kPoolBuffer,
+        vPool: cacheManager.vPoolBuffer,
+        blockTable: blockTableBuffer,
+        seqLen: seq.sequenceLength,
+        headDim: headDim,
+        numHeads: numHeads,
+        numKVHeads: numKVHeads,
+        numBlocks: cacheManager.maxBlocks,
+        blockSize: cacheManager.blockSize,
+        output: bufO,
+        dataType: .float32
+    )
+    
+    // Free the sequence
+    cacheManager.freeSequence(id: 42)
+    assert(cacheManager.availableBlocks == initialFreeBlocks, "Blocks not freed!")
+    
+    print("✓ KVCacheManager verified successfully!")
+}
+
 // MARK: - Entry Point
 
 import XCTest
@@ -1391,5 +1457,6 @@ final class PagedAttentionMetalTests: XCTestCase {
         }
         runMultiHeadPagedAttention()
         runGroupedQueryAttention()
+        runKVCacheManagerTest()
     }
 }

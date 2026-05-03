@@ -55,33 +55,60 @@ targets: [
 
 ## 🛠 Quick Start
 
-The library exposes a clean, high-level Swift wrapper (`PagedAttentionEngine`). You do not need to manually configure Metal devices, manage compute pipelines, or calculate threadgroup grids—the engine dynamically handles the math based on your input tensors.
+Using `PagedAttentionMetal` requires two components: the **Memory Manager** (to handle virtual-to-physical block mapping) and the **Compute Engine** (to execute the Metal shaders). 
+
+Here is how you execute a complete LLM generation step:
 
 ```swift
 import PagedAttentionMetal
 import Metal
 
-// 1. Initialize the Engine
-// This automatically discovers your Apple Silicon GPU and JIT-compiles the kernels.
+// 1. Initialize the Hardware Engine
+// Automatically compiles the Apple Silicon Mixed-Precision kernels.
+let device = MTLCreateSystemDefaultDevice()!
 let engine = try PagedAttentionEngine()
 
-// 2. Dispatch the GPU Forward Pass (e.g. Mixed Precision FP16)
+// 2. Initialize the KV Cache Memory Manager
+// This acts as the GPU OS, pre-allocating a massive pool of VRAM.
+let cacheManager = KVCacheManager(
+    device: device,
+    maxBlocks: 1024,             // Pre-allocate 1024 physical KV blocks
+    blockSize: 16,               // 16 tokens per block
+    headDim: 128,                // Dimension per attention head
+    numKVHeads: 2,               // 2 KV Heads (GQA)
+    dataType: .float16           // ⚡️ FP16 Mixed Precision for 2x Bandwidth!
+)
+
+// --- A New User Connects! ---
+
+// 3. Register their Sequence
+let sequenceID = 1
+try cacheManager.allocateSequence(id: sequenceID)
+
+// 4. They submit a 25-token prompt. 
+// The Manager automatically reserves 2 physical blocks (32 token capacity) from the free list.
+try cacheManager.appendTokens(toSequence: sequenceID, count: 25)
+
+// 5. Dispatch the GPU Forward Pass
 try engine.forward(
     q: queryBuffer,              // Your Q sequence [seqLen, numHeads, headDim]
-    kPool: keyCachePool,         // Pre-allocated Key Cache
-    vPool: valueCachePool,       // Pre-allocated Value Cache
-    blockTable: blockMapBuffer,  // Paged memory mapping [Int32]
-    seqLen: 1024,                // Sequence Length
-    headDim: 128,                // Dimension per attention head
-    numHeads: 8,                 // Query Heads
-    numKVHeads: 2,               // KV Heads (GQA ratio 4:1)
-    numBlocks: 64,               // Total KV blocks in your memory pool
-    blockSize: 16,               // Tokens mapped per physical block
-    output: outputBuffer,        // Destination buffer
-    dataType: .float16           // Enable Memory Bandwidth Optimization!
+    kPool: cacheManager.kPoolBuffer,  // Managed dynamically!
+    vPool: cacheManager.vPoolBuffer,  // Managed dynamically!
+    blockTable: try cacheManager.getBlockTableBuffer(forSequence: sequenceID),
+    seqLen: 25,
+    headDim: 128,
+    numHeads: 8,
+    numKVHeads: 2,
+    numBlocks: cacheManager.maxBlocks,
+    blockSize: cacheManager.blockSize,
+    output: outputBuffer,
+    dataType: cacheManager.dataType
 )
 
 print("Attention calculated natively on Apple Silicon!")
+
+// 6. When the user disconnects, recycle their memory instantly in O(1)
+cacheManager.freeSequence(id: sequenceID)
 ```
 
 ---
