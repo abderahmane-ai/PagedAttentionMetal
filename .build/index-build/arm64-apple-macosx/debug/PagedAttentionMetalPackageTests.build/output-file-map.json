@@ -1,0 +1,12 @@
+{
+  "": {
+    "swift-dependencies": "/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetalPackageTests.build/primary.swiftdeps"
+  },
+  "/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetalPackageTests.derived/runner.swift": {
+    "dependencies": "/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetalPackageTests.build/runner.d",
+    "object": "/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetalPackageTests.build/runner.swift.o",
+    "swiftmodule": "/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetalPackageTests.build/runner~partial.swiftmodule",
+    "swift-dependencies": "/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetalPackageTests.build/runner.swiftdeps",
+    "diagnostics": "/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetalPackageTests.build/runner.dia"
+  }
+}

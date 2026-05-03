@@ -1,0 +1,99 @@
+client:
+  name: basic
+  file-system: device-agnostic
+tools: {}
+targets:
+  "PackageStructure": ["<PackageStructure>"]
+  "PagedAttentionMetal-arm64-apple-macosx-debug.module": ["<PagedAttentionMetal-arm64-apple-macosx-debug.module>"]
+  "PagedAttentionMetalPackageTests-arm64-apple-macosx-debug.module": ["<PagedAttentionMetalPackageTests-arm64-apple-macosx-debug.module>"]
+  "PagedAttentionMetalTests-arm64-apple-macosx-debug.module": ["<PagedAttentionMetalTests-arm64-apple-macosx-debug.module>"]
+  "main": ["<PagedAttentionMetal-arm64-apple-macosx-debug.module>"]
+  "test": ["<PagedAttentionMetal-arm64-apple-macosx-debug.module>","<PagedAttentionMetalTests-arm64-apple-macosx-debug.module>"]
+default: "main"
+nodes:
+  "/Users/abdoumagico/Development/PagedAttentionMetal/Sources/PagedAttentionMetal/":
+    is-directory-structure: true
+    content-exclusion-patterns: [".git",".build"]
+  "/Users/abdoumagico/Development/PagedAttentionMetal/Tests/PagedAttentionMetalTests/":
+    is-directory-structure: true
+    content-exclusion-patterns: [".git",".build"]
+commands:
+  "/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetal.build/sources":
+    tool: write-auxiliary-file
+    inputs: ["<sources-file-list>","/Users/abdoumagico/Development/PagedAttentionMetal/Sources/PagedAttentionMetal/PagedAttentionEngine.swift","/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetal.build/DerivedSources/resource_bundle_accessor.swift"]
+    outputs: ["/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetal.build/sources"]
+    description: "Write auxiliary file /Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetal.build/sources"
+
+  "/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetalPackageTests.build/sources":
+    tool: write-auxiliary-file
+    inputs: ["<sources-file-list>","/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetalPackageTests.derived/runner.swift"]
+    outputs: ["/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetalPackageTests.build/sources"]
+    description: "Write auxiliary file /Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetalPackageTests.build/sources"
+
+  "/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetalTests.build/sources":
+    tool: write-auxiliary-file
+    inputs: ["<sources-file-list>","/Users/abdoumagico/Development/PagedAttentionMetal/Tests/PagedAttentionMetalTests/PagedAttentionMetalTests.swift"]
+    outputs: ["/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetalTests.build/sources"]
+    description: "Write auxiliary file /Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetalTests.build/sources"
+
+  "/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetal_PagedAttentionMetal.bundle/kernels.metal":
+    tool: copy-tool
+    inputs: ["/Users/abdoumagico/Development/PagedAttentionMetal/Sources/PagedAttentionMetal/kernels.metal"]
+    outputs: ["/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetal_PagedAttentionMetal.bundle/kernels.metal"]
+    description: "Copying /Users/abdoumagico/Development/PagedAttentionMetal/Sources/PagedAttentionMetal/kernels.metal"
+
+  "/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt":
+    tool: write-auxiliary-file
+    inputs: ["<swift-get-version>","/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"]
+    outputs: ["/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt"]
+    always-out-of-date: "true"
+    description: "Write auxiliary file /Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt"
+
+  "<PagedAttentionMetal-arm64-apple-macosx-debug.module>":
+    tool: phony
+    inputs: ["/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/Modules/PagedAttentionMetal.swiftmodule"]
+    outputs: ["<PagedAttentionMetal-arm64-apple-macosx-debug.module>"]
+
+  "<PagedAttentionMetalPackageTests-arm64-apple-macosx-debug.module>":
+    tool: phony
+    inputs: ["/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/Modules/PagedAttentionMetalPackageTests.swiftmodule"]
+    outputs: ["<PagedAttentionMetalPackageTests-arm64-apple-macosx-debug.module>"]
+
+  "<PagedAttentionMetalTests-arm64-apple-macosx-debug.module>":
+    tool: phony
+    inputs: ["/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/Modules/PagedAttentionMetalTests.swiftmodule"]
+    outputs: ["<PagedAttentionMetalTests-arm64-apple-macosx-debug.module>"]
+
+  "C.PagedAttentionMetal-arm64-apple-macosx-debug.module":
+    tool: shell
+    inputs: ["/Users/abdoumagico/Development/PagedAttentionMetal/Sources/PagedAttentionMetal/PagedAttentionEngine.swift","/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetal.build/DerivedSources/resource_bundle_accessor.swift","/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt","<PagedAttentionMetal-arm64-apple-macosx-debug.module-resources>","/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetal.build/sources"]
+    outputs: ["/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/Modules/PagedAttentionMetal.swiftmodule"]
+    description: "Compiling Swift Module 'PagedAttentionMetal' (2 sources)"
+    args: ["/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc","-module-name","PagedAttentionMetal","-emit-dependencies","-emit-module","-emit-module-path","/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/Modules/PagedAttentionMetal.swiftmodule","-output-file-map","/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetal.build/output-file-map.json","-parse-as-library","-incremental","@/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetal.build/sources","-I","/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/Modules","-target","arm64-apple-macosx13.0","-incremental","-enable-batch-mode","-serialize-diagnostics","-Onone","-enable-testing","-j10","-DSWIFT_PACKAGE","-DDEBUG","-DSWIFT_MODULE_RESOURCE_BUNDLE_AVAILABLE","-module-cache-path","/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/ModuleCache","-parseable-output","-parse-as-library","-emit-objc-header","-emit-objc-header-path","/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetal.build/include/PagedAttentionMetal-Swift.h","-swift-version","6","-Xfrontend","-experimental-lazy-typecheck","-Xfrontend","-experimental-skip-all-function-bodies","-Xfrontend","-experimental-allow-module-with-compiler-errors","-Xfrontend","-empty-abi-descriptor","-plugin-path","/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/host/plugins/testing","-sdk","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.4.sdk","-F","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks","-I","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-L","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-g","-Xcc","-isysroot","-Xcc","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.4.sdk","-Xcc","-F","-Xcc","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks","-Xcc","-fPIC","-Xcc","-g","-package-name","pagedattentionmetal"]
+
+  "C.PagedAttentionMetalPackageTests-arm64-apple-macosx-debug.module":
+    tool: shell
+    inputs: ["/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetalPackageTests.derived/runner.swift","/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt","/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/Modules/PagedAttentionMetalTests.swiftmodule","/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetalPackageTests.build/sources"]
+    outputs: ["/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/Modules/PagedAttentionMetalPackageTests.swiftmodule"]
+    description: "Compiling Swift Module 'PagedAttentionMetalPackageTests' (1 sources)"
+    args: ["/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc","-module-name","PagedAttentionMetalPackageTests","-emit-dependencies","-emit-module","-emit-module-path","/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/Modules/PagedAttentionMetalPackageTests.swiftmodule","-output-file-map","/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetalPackageTests.build/output-file-map.json","-parse-as-library","-incremental","@/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetalPackageTests.build/sources","-I","/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/Modules","-target","arm64-apple-macosx13.0","-incremental","-enable-batch-mode","-serialize-diagnostics","-Onone","-enable-testing","-Xfrontend","-enable-cross-import-overlays","-j10","-DSWIFT_PACKAGE","-DDEBUG","-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE","-module-cache-path","/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/ModuleCache","-parseable-output","-parse-as-library","-emit-objc-header","-emit-objc-header-path","/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetalPackageTests.build/include/PagedAttentionMetalPackageTests-Swift.h","-Xfrontend","-experimental-lazy-typecheck","-Xfrontend","-experimental-skip-all-function-bodies","-Xfrontend","-experimental-allow-module-with-compiler-errors","-Xfrontend","-empty-abi-descriptor","-plugin-path","/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/host/plugins/testing","-sdk","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.4.sdk","-F","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks","-I","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-L","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-g","-Xcc","-isysroot","-Xcc","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.4.sdk","-Xcc","-F","-Xcc","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks","-Xcc","-fPIC","-Xcc","-g","-package-name","pagedattentionmetal"]
+
+  "C.PagedAttentionMetalTests-arm64-apple-macosx-debug.module":
+    tool: shell
+    inputs: ["/Users/abdoumagico/Development/PagedAttentionMetal/Tests/PagedAttentionMetalTests/PagedAttentionMetalTests.swift","/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt","/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/Modules/PagedAttentionMetal.swiftmodule","/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetalTests.build/sources"]
+    outputs: ["/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/Modules/PagedAttentionMetalTests.swiftmodule"]
+    description: "Compiling Swift Module 'PagedAttentionMetalTests' (1 sources)"
+    args: ["/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc","-module-name","PagedAttentionMetalTests","-emit-dependencies","-emit-module","-emit-module-path","/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/Modules/PagedAttentionMetalTests.swiftmodule","-output-file-map","/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetalTests.build/output-file-map.json","-parse-as-library","-incremental","@/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetalTests.build/sources","-I","/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/Modules","-target","arm64-apple-macosx14.0","-incremental","-enable-batch-mode","-serialize-diagnostics","-Onone","-enable-testing","-Xfrontend","-enable-cross-import-overlays","-j10","-DSWIFT_PACKAGE","-DDEBUG","-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE","-module-cache-path","/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/ModuleCache","-parseable-output","-parse-as-library","-swift-version","6","-Xfrontend","-experimental-lazy-typecheck","-Xfrontend","-experimental-skip-all-function-bodies","-Xfrontend","-experimental-allow-module-with-compiler-errors","-Xfrontend","-empty-abi-descriptor","-plugin-path","/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/host/plugins/testing","-sdk","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.4.sdk","-F","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks","-I","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-L","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-g","-Xcc","-isysroot","-Xcc","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.4.sdk","-Xcc","-F","-Xcc","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks","-Xcc","-fPIC","-Xcc","-g","-package-name","pagedattentionmetal"]
+
+  "PackageStructure":
+    tool: package-structure-tool
+    inputs: ["/Users/abdoumagico/Development/PagedAttentionMetal/Sources/PagedAttentionMetal/","/Users/abdoumagico/Development/PagedAttentionMetal/Tests/PagedAttentionMetalTests/","/Users/abdoumagico/Development/PagedAttentionMetal/Package.swift","/Users/abdoumagico/Development/PagedAttentionMetal/Package.resolved"]
+    outputs: ["<PackageStructure>"]
+    description: "Planning build"
+    allow-missing-inputs: true
+
+  "PagedAttentionMetal-arm64-apple-macosx-debug.module-resources":
+    tool: phony
+    inputs: ["/Users/abdoumagico/Development/PagedAttentionMetal/.build/index-build/arm64-apple-macosx/debug/PagedAttentionMetal_PagedAttentionMetal.bundle/kernels.metal"]
+    outputs: ["<PagedAttentionMetal-arm64-apple-macosx-debug.module-resources>"]
+
