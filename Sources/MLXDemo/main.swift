@@ -68,6 +68,9 @@ do {
     
     print("\n✅ Native MLX works!")
     
+    // Run PagedAttention vs MLX attention comparison
+    runAttentionComparison(device: device, engine: try! PagedAttentionEngine())
+
     // Test PagedAttention engine
     print("\n[2/2] Testing PagedAttention engine...")
     
