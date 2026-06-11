@@ -7,10 +7,14 @@ let package = Package(
     platforms: [
         .macOS(.v14), .iOS(.v17)
     ],
+    // "Homepage" and "License" are documented at the repository root (README.md, LICENSE).
     products: [
         .library(
             name: "PagedAttentionMetal",
             targets: ["PagedAttentionMetal"]),
+        .library(
+            name: "PagedAttentionMLXSupport",
+            targets: ["PagedAttentionMLXSupport"]),
         .executable(
             name: "MinimalLLM",
             targets: ["MinimalLLM"]),
@@ -20,17 +24,29 @@ let package = Package(
         .executable(
             name: "MLXDemo",
             targets: ["MLXDemo"]),
+        .executable(
+            name: "Profiler",
+            targets: ["Profiler"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.31.0"),
         .package(url: "https://github.com/ml-explore/mlx-swift-lm", from: "3.31.0"),
         .package(url: "https://github.com/huggingface/swift-transformers", branch: "main"),
         .package(url: "https://github.com/huggingface/swift-huggingface", from: "0.1.0"),
+        .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.4.3"),
     ],
     targets: [
         .target(
             name: "PagedAttentionMetal",
             resources: [.process("kernels.metal")]
+        ),
+        .target(
+            name: "PagedAttentionMLXSupport",
+            dependencies: [
+                "PagedAttentionMetal",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+            ]
         ),
         .executableTarget(
             name: "MinimalLLM",
@@ -46,6 +62,7 @@ let package = Package(
             name: "MLXDemo",
             dependencies: [
                 "PagedAttentionMetal",
+                "PagedAttentionMLXSupport",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
@@ -57,9 +74,14 @@ let package = Package(
             ],
             path: "Sources/MLXDemo"
         ),
+        .executableTarget(
+            name: "Profiler",
+            dependencies: ["PagedAttentionMetal"],
+            path: "Profiler/Sources"
+        ),
         .testTarget(
             name: "PagedAttentionMetalTests",
-            dependencies: ["PagedAttentionMetal"]),
+            dependencies: ["PagedAttentionMetal", "PagedAttentionMLXSupport"]),
     ],
     swiftLanguageModes: [.v6]
 )

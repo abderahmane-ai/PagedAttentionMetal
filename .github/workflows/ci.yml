@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: macos-15  # Apple Silicon runner
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+      - name: Build
+        run: swift build
+      - name: Test
+        run: swift test
+      - name: Benchmarks (quick)
+        run: swift run -c release Benchmarks prefill --seq-len 512 --iterations 3

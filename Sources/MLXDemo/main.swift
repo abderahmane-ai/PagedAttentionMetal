@@ -4,10 +4,44 @@ import MLX
 import MLXLLM
 import MLXLMCommon
 import PagedAttentionMetal
+import PagedAttentionMLXSupport
+
+func useExecutableDirectoryForMLXMetallibLookup() {
+    let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    let executableURL = URL(fileURLWithPath: CommandLine.arguments[0], relativeTo: cwd).standardizedFileURL
+    let executableDirectory = executableURL.deletingLastPathComponent()
+    let metallibURL = executableDirectory.appendingPathComponent("default.metallib")
+
+    if FileManager.default.fileExists(atPath: metallibURL.path) {
+        FileManager.default.changeCurrentDirectoryPath(executableDirectory.path)
+    }
+}
+
+useExecutableDirectoryForMLXMetallibLookup()
 
 print("=== MLX + PagedAttention Demo ===\n")
 
 do {
+    guard let device = MTLCreateSystemDefaultDevice() else {
+        print("❌ No Metal device")
+        exit(1)
+    }
+
+    let layer = PagedLayerSpec(
+        headDim: 128,
+        numHeads: 8,
+        numKVHeads: 2,
+        blockSize: 16,
+        dataType: .float16
+    )
+    let pagedMLXCache = try PagedMetalKVCache(
+        sequenceID: 1,
+        layer: layer,
+        maxBlocks: 64,
+        device: device
+    )
+    print("✅ Paged MLX cache initialized: \(pagedMLXCache.cacheManager.availableBlocks) blocks available")
+
     // Load model
     let loader = ModelLoader()
     let model = try await loader.load()
@@ -36,11 +70,6 @@ do {
     
     // Test PagedAttention engine
     print("\n[2/2] Testing PagedAttention engine...")
-    
-    guard let device = MTLCreateSystemDefaultDevice() else {
-        print("❌ No Metal device")
-        exit(1)
-    }
     
     do {
         let _ = try PagedAttentionEngine()

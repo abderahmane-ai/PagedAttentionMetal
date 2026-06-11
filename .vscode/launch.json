@@ -19,6 +19,66 @@
             "target": "PagedAttentionMLX",
             "configuration": "release",
             "preLaunchTask": "swift: Build Release PagedAttentionMLX"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:PagedAttentionMetal}",
+            "name": "Debug MinimalLLM",
+            "target": "MinimalLLM",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug MinimalLLM"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:PagedAttentionMetal}",
+            "name": "Release MinimalLLM",
+            "target": "MinimalLLM",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release MinimalLLM"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:PagedAttentionMetal}",
+            "name": "Debug Benchmarks",
+            "target": "Benchmarks",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug Benchmarks"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:PagedAttentionMetal}",
+            "name": "Release Benchmarks",
+            "target": "Benchmarks",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release Benchmarks"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:PagedAttentionMetal}",
+            "name": "Debug MLXDemo",
+            "target": "MLXDemo",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug MLXDemo"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:PagedAttentionMetal}",
+            "name": "Release MLXDemo",
+            "target": "MLXDemo",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release MLXDemo"
         }
     ]
 }

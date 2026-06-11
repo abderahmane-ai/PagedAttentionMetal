@@ -5,16 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [3.0.0] - 2026-06-11
 
 ### Added
-- **Threadgroup memory safety check:** Automatic detection of threadgroup memory overflow
-- **Auto-switch to split-K:** Prevents crashes on M1 (32KB limit) by switching to split-K when needed
-- **Device-aware dispatch:** Checks `device.maxThreadgroupMemoryLength` before kernel dispatch
+- **Prefix Cache:** Content-addressable block sharing with copy-on-write
+- **Sliding Window Attention:** Windowed attention for efficient long-context inference
+- **Chunked Prefill:** Split long prefill into chunks to interleave with decode
+- **FP8 KV Cache Quantization:** 5 new Metal kernels for FP8 support with 2-pass append
+- **Continuous Batching Scheduler:** FIFO-based preemption with memory-pressure callback
+- **Memory Auto-Profiling:** `recommendedMaxBlocks()` queries GPU working set size
+- **Memory Pool Policies:** FIFO, LIFO, and BestFit eviction strategies
+- **Fused Append+Prefill Kernel:** 3 new kernels (f32, f16, fp8) combining append + attention
+- **Async Command Buffer Pre-processing:** Background command buffer preparation
+- **Multi-Layer Batching:** Encode all layers into one command buffer
+- **Performance Benchmarking Suite:** Prefill/decode benchmarks with scaling variants, CSV output
+- **Inference Engine:** `PagedAttentionInference` combining engine + cache + scheduler
+- **Production Hardening:** 5 new error cases, `withRetry()` with exponential backoff and circuit breaker, OSLog logging, graceful degradation
+- **19 Edge-Case Tests:** Empty sequences, zero blocks, immediate free, concurrent access, etc.
+- **CI Pipeline:** GitHub Actions for build → test → benchmarks on macOS 15
+- **Profiling Tool:** Comprehensive Metal profiling with prefill/decode sweeps across seqLens and dtypes
+- **Swift Testing Migration:** All 20 tests migrated from XCTest to Swift Testing
+- **DocC Documentation:** Documentation comments on all public API types and methods
 
 ### Changed
-- Prefill now validates threadgroup memory requirements before single-pass dispatch
-- Split-K triggered by memory limit OR sequence length threshold
+- **Package.swift:** Added `PagedAttentionMLXSupport` target, `Profiler` executable target
+- **Test harness:** Migrated from XCTest to Swift Testing framework
+- **Warnings cleaned:** Removed 3 unused variables in KVCacheManager
+- **Benchmark CLI:** Fixed `String(format: "%s")` hang with Swift strings
+
+### Fixed
+- **Benchmark hang:** `String(format: "%-28s...")` with Swift `String` values using `%s` format specifier caused undefined behavior (hang on Apple Silicon); replaced with string interpolation
 
 ## [2.0.0] - 2026-05-03
 
@@ -54,8 +74,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Dynamic KV Cache Manager:** Added `KVCacheManager.swift`, a GPU memory orchestrator that automatically tracks, allocates, and frees physical KV blocks for virtual LLM sequences in O(1) time.
 - **SIMD FP16 Helpers:** Added custom `simd_dot_product_f16` vector instructions, utilizing `float4` to extract maximum ALU performance out of 16-bit cache reads.
 - **Public API Scaling:** Expanded `PagedAttentionEngine.forward()` to accept `numHeads`, `numKVHeads`, and `dataType` arguments for direct precision and architectural configuration.
-- **Verification Tests:** Added rigorous `runMultiHeadPagedAttention()`, `runGroupedQueryAttention()`, and `runKVCacheManagerTest()` CPU/GPU validations.
-- **ExampleApp Benchmarks:** Added an explicit FP32 vs FP16 latency benchmark to the ExampleApp executable, demonstrating near theoretical-maximum speedups.
+- **Verification Tests:** Added rigorous CPU/GPU validation tests ensuring mathematical correctness.
+- **Comprehensive Benchmarks:** Added dedicated benchmark suite with FP32 vs FP16 latency comparison.
 
 ### Changed
 - **Threadgroup Stability:** Hardened `paged_attention_single` kernel by unifying vector declarations to `uint3` to guarantee compilation stability on Apple Silicon.
@@ -65,7 +85,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 - **Dead Code Eradication:** Purged orphaned `paged_attention_half` and `kv_cache_copy` kernels, along with legacy global `PipelineCache` aliases.
 - **SPM Boilerplate:** Removed all auto-generated template comments from `Package.swift`.
-- **Ghost Tests:** Deleted empty scaffolding code inside `ExampleApp/Tests`.
 
 ## [0.1.0] - 2026-05-02
 

@@ -119,69 +119,86 @@ class SyntheticLLM {
         q: [Float], k: [Float], v: [Float],
         sequenceID: Int, layer: Int, seqLen: Int, isPrefill: Bool
     ) throws -> [Float] {
+        let qHalf = q.map { Float16($0) }
+        let kHalf = k.map { Float16($0) }
+        let vHalf = v.map { Float16($0) }
+
         // Create Metal buffers
         guard let qBuffer = device.makeBuffer(
-            bytes: q, length: q.count * MemoryLayout<Float>.stride, options: .storageModeShared
+            bytes: qHalf, length: qHalf.count * MemoryLayout<Float16>.stride, options: .storageModeShared
         ) else { fatalError("Failed to create Q buffer") }
         
         guard let kBuffer = device.makeBuffer(
-            bytes: k, length: k.count * MemoryLayout<Float>.stride, options: .storageModeShared
+            bytes: kHalf, length: kHalf.count * MemoryLayout<Float16>.stride, options: .storageModeShared
         ) else { fatalError("Failed to create K buffer") }
         
         guard let vBuffer = device.makeBuffer(
-            bytes: v, length: v.count * MemoryLayout<Float>.stride, options: .storageModeShared
+            bytes: vHalf, length: vHalf.count * MemoryLayout<Float16>.stride, options: .storageModeShared
         ) else { fatalError("Failed to create V buffer") }
         
         // Append K/V to cache
         let blockTable = try cacheManager.getBlockTableBuffer(forSequence: sequenceID)
         let currentLen = try cacheManager.getSequence(id: sequenceID).sequenceLength
+        let tokenOffset = currentLen - seqLen
+        let layerSpec = PagedLayerSpec(
+            headDim: headDim,
+            numHeads: numHeads,
+            numKVHeads: numKVHeads,
+            blockSize: blockSize,
+            dataType: .float16
+        )
         
-        engine.appendToCache(
+        try engine.appendToCache(PagedKVAppendRequest(
             keys: kBuffer,
             values: vBuffer,
             kPool: cacheManager.kPoolBuffer,
             vPool: cacheManager.vPoolBuffer,
             blockTable: blockTable,
-            tokenOffset: currentLen,
+            tokenOffset: tokenOffset,
             numNewTokens: seqLen,
-            numKVHeads: numKVHeads,
-            headDim: headDim,
-            blockSize: blockSize,
-            dataType: .float16
-        )
+            layer: layerSpec
+        ))
         
         // Run attention
         let outputSize = seqLen * numHeads * headDim
         guard let outputBuffer = device.makeBuffer(
-            length: outputSize * MemoryLayout<Float>.stride, options: .storageModeShared
+            length: outputSize * MemoryLayout<Float16>.stride, options: .storageModeShared
         ) else { fatalError("Failed to create output buffer") }
         
         if isPrefill {
-            engine.prefill(
-                q: qBuffer, kPool: cacheManager.kPoolBuffer, vPool: cacheManager.vPoolBuffer,
-                blockTable: blockTable, seqLen: seqLen, headDim: headDim,
-                numHeads: numHeads, numKVHeads: numKVHeads, blockSize: blockSize,
-                causal: true, output: outputBuffer, dataType: .float16
-            )
+            try engine.prefill(PagedAttentionPrefillRequest(
+                q: qBuffer,
+                kPool: cacheManager.kPoolBuffer,
+                vPool: cacheManager.vPoolBuffer,
+                blockTable: blockTable,
+                output: outputBuffer,
+                seqLen: seqLen,
+                layer: layerSpec,
+                causal: true
+            ))
         } else {
-            let seqLengths = [Int32(currentLen + seqLen)]
+            let seqLengths = [UInt32(currentLen)]
             guard let seqLenBuffer = device.makeBuffer(
-                bytes: seqLengths, length: MemoryLayout<Int32>.stride, options: .storageModeShared
+                bytes: seqLengths, length: MemoryLayout<UInt32>.stride, options: .storageModeShared
             ) else { fatalError("Failed to create seqLen buffer") }
             
             let numBlocks = try cacheManager.getSequence(id: sequenceID).blockTable.count
-            engine.decode(
-                q: qBuffer, kPool: cacheManager.kPoolBuffer, vPool: cacheManager.vPoolBuffer,
-                blockTables: blockTable, seqLengths: seqLenBuffer, batchSize: 1,
+            try engine.decode(PagedAttentionDecodeRequest(
+                q: qBuffer,
+                kPool: cacheManager.kPoolBuffer,
+                vPool: cacheManager.vPoolBuffer,
+                blockTables: blockTable,
+                seqLengths: seqLenBuffer,
+                output: outputBuffer,
+                batchSize: 1,
                 maxNumBlocks: numBlocks,
-                headDim: headDim, numHeads: numHeads, numKVHeads: numKVHeads,
-                blockSize: blockSize, output: outputBuffer, dataType: .float16
-            )
+                layer: layerSpec
+            ))
         }
         
         // Read output
-        let ptr = outputBuffer.contents().assumingMemoryBound(to: Float.self)
-        return Array(UnsafeBufferPointer(start: ptr, count: outputSize))
+        let ptr = outputBuffer.contents().assumingMemoryBound(to: Float16.self)
+        return (0..<outputSize).map { Float(ptr[$0]) }
     }
     
     /// Project attention output to logits
