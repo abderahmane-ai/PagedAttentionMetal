@@ -13,7 +13,6 @@ import Metal
         engine = try! PagedAttentionEngine()
     }
 
-    // MARK: - Helpers
 
     func makeBuffer<T>(from data: [T]) -> MTLBuffer {
         data.withUnsafeBytes { ptr in
@@ -67,7 +66,6 @@ import Metal
         zip(a, b).map { abs($0 - $1) }.max() ?? 0
     }
 
-    // MARK: - Test 1: Correctness vs CPU Reference
 
     @Test func correctnessVsCPU() throws {
         print("\n=== Test 1: Correctness vs CPU Reference ===")
@@ -179,7 +177,6 @@ import Metal
         #expect(maxErr < 0.1, "MMA output differs from CPU")
         print("  \u{2713} MMA correctness verified")
 
-        // Also test float32 (flash prefill) against CPU for validation
         let cache32 = KVCacheManager(device: device, maxBlocks: 8, blockSize: blockSize, headDim: headDim, numKVHeads: numKVHeads, dataType: .float32)
         try cache32.allocateSequence(id: 2)
         try cache32.appendTokens(toSequence: 2, count: seqLen)
@@ -207,7 +204,6 @@ import Metal
         print("  FP32 first output: \(fp32output[0]), \(fp32output[1]), \(fp32output[2]), \(fp32output[3])")
     }
 
-    // MARK: - Test 2: Causal Masking Correctness
 
     @Test func causalMasking() throws {
         print("\n=== Test 2: Causal Masking ===")
@@ -257,7 +253,6 @@ import Metal
     }
 
 
-    // MARK: - Test 3: Grouped-Query Attention (GQA)
 
     @Test func gqa() throws {
         print("\n=== Test 3: Grouped-Query Attention ===")
@@ -308,7 +303,6 @@ import Metal
     }
 
 
-    // MARK: - Test 4: FP16 Correctness & Performance
 
     @Test func fp16Performance() throws {
         print("\n=== Test 4: FP16 vs FP32 ===")
@@ -324,7 +318,6 @@ import Metal
         let k = (0..<(seqLen * numKVHeads * headDim)).map { _ in Float.random(in: -1...1) }
         let v = (0..<(seqLen * numKVHeads * headDim)).map { _ in Float.random(in: -1...1) }
 
-        // FP32
         let cache32 = KVCacheManager(device: device, maxBlocks: 64, blockSize: blockSize, headDim: headDim, numKVHeads: numKVHeads, dataType: .float32)
         try cache32.allocateSequence(id: 1)
         try cache32.appendTokens(toSequence: 1, count: seqLen)
@@ -356,7 +349,6 @@ import Metal
         let time32 = Date().timeIntervalSince(start32) * 1000 / Double(iterations)
         let output32 = readFloats(from: bufO32, count: seqLen * numHeads * headDim)
 
-        // FP16
         let cache16 = KVCacheManager(device: device, maxBlocks: 64, blockSize: blockSize, headDim: headDim, numKVHeads: numKVHeads, dataType: .float16)
         try cache16.allocateSequence(id: 1)
         try cache16.appendTokens(toSequence: 1, count: seqLen)
@@ -404,7 +396,6 @@ import Metal
     }
 
 
-    // MARK: - Test 5: Batch Decode
 
     @Test func batchDecode() throws {
         print("\n=== Test 5: Batch Decode ===")
@@ -441,7 +432,6 @@ import Metal
         print("  \u{2713} Batch decode completed for \(batchSize) sequences")
     }
 
-    // MARK: - Test 6: Variable Block Sizes
 
     @Test func variableBlockSizes() throws {
         print("\n=== Test 6: Variable Block Sizes ===")
@@ -496,7 +486,6 @@ import Metal
         print("  \u{2713} Block sizes 8, 16, 32 all produce identical results")
     }
 
-    // MARK: - Test 7: Checked API validation and stats
 
     @Test func checkedAPIValidationAndStats() throws {
         let seqLen = 8
@@ -542,7 +531,6 @@ import Metal
         #expect(engine.lastStats.sequenceLength == seqLen)
     }
 
-    // MARK: - Test 8: Split-pass fallback for large threadgroups
 
     @Test func prefillFallsBackToSplitWhenSinglePassThreadgroupIsTooLarge() throws {
         let seqLen = 32
@@ -594,7 +582,6 @@ import Metal
         #expect(!values.allSatisfy { $0 == 0 })
     }
 
-    // MARK: - Test 9: C ABI lifecycle
 
     @Test func cabiLifecycle() throws {
         guard let context = pam_create_context() else {
@@ -617,7 +604,6 @@ import Metal
         #expect(pam_available_blocks(cache) == 8)
     }
 
-    // MARK: - Test 10: MLX support cache construction
 
     @Test func mlxSupportCacheConstruction() throws {
         let layer = PagedLayerSpec(headDim: 64, numHeads: 8, numKVHeads: 2, blockSize: 16, dataType: .float16)
@@ -633,7 +619,6 @@ import Metal
         #expect(cache.layer == layer)
     }
 
-    // MARK: - Test 11: FP8 Quantization
 
     @Test func fp8Quantization() throws {
         print("\n=== Test 11: FP8 Quantization ===")
@@ -649,7 +634,6 @@ import Metal
         let k = (0..<(seqLen * numKVHeads * headDim)).map { _ in Float.random(in: -1...1) }
         let v = (0..<(seqLen * numKVHeads * headDim)).map { _ in Float.random(in: -1...1) }
 
-        // FP16 reference
         let cache16 = KVCacheManager(device: device, maxBlocks: numBlocks, blockSize: blockSize,
                                       headDim: headDim, numKVHeads: numKVHeads, dataType: .float16)
         try cache16.allocateSequence(id: 1)
@@ -682,7 +666,6 @@ import Metal
                       blockSize: blockSize, causal: false, output: bufO16, dataType: .float16)
         let output16 = readFloat16s(from: bufO16, count: seqLen * numHeads * headDim)
 
-        // FP8
         let fp8PoolBytes = numBlocks * blockSize * numKVHeads * headDim
         guard let kPoolFP8 = device.makeBuffer(length: fp8PoolBytes, options: .storageModeShared),
               let vPoolFP8 = device.makeBuffer(length: fp8PoolBytes, options: .storageModeShared),
@@ -728,7 +711,6 @@ import Metal
         print("  \u{2713} FP8 quantization verified (max error \(maxErr))")
     }
 
-    // MARK: - Phase 5: Fuzzing & Edge Case Tests
 
     @Test func emptySequencePrefill() throws {
         let cache = KVCacheManager(device: device, maxBlocks: 4, blockSize: 16, headDim: 32, numKVHeads: 1, dataType: .float32)
@@ -941,7 +923,6 @@ import Metal
         print("  \u{2713} Simultaneous prefill & decode completed")
     }
 
-    // MARK: - Test 12: Fused Append + Prefill
 
     @Test func fusedPrefill() throws {
         print("\n=== Test 12: Fused Append + Prefill ===")
@@ -966,7 +947,6 @@ import Metal
             }
         }
 
-        // --- Fused version ---
         let cacheFused = KVCacheManager(device: device, maxBlocks: numBlocks, blockSize: blockSize,
                                          headDim: headDim, numKVHeads: numKVHeads, dataType: .float32)
         try cacheFused.allocateSequence(id: 1)
@@ -995,7 +975,6 @@ import Metal
 
         let outputFused = readFloats(from: bufOFused, count: seqLen * numHeads * headDim)
 
-        // --- Non-fused version (append + prefill) ---
         let cacheSep = KVCacheManager(device: device, maxBlocks: numBlocks, blockSize: blockSize,
                                        headDim: headDim, numKVHeads: numKVHeads, dataType: .float32)
         try cacheSep.allocateSequence(id: 1)
@@ -1103,7 +1082,6 @@ import Metal
                           numKVHeads: numKVHeads, blockSize: blockSize,
                           causal: false, output: output2, dataType: .float32)
         } catch {
-            // Expected to possibly throw without graceful degradation
         }
         engine.enableGracefulDegradation = true
     }

@@ -4,15 +4,10 @@ import MLX
 import MLXLMCommon
 import PagedAttentionMetal
 
-/// Errors thrown by the PagedAttention MLX integration layer.
 public enum PagedAttentionMLXError: Error, CustomStringConvertible {
-    /// The Metal device is unavailable (nil).
     case metalDeviceUnavailable
-    /// The MLX tensor shape is not supported.
     case unsupportedShape(String)
-    /// Failed to create a Metal buffer from an MLX array.
     case bufferCreationFailed(String)
-    /// The attention mask mode is not supported.
     case unsupportedMask(String)
 
     public var description: String {
@@ -29,37 +24,17 @@ public enum PagedAttentionMLXError: Error, CustomStringConvertible {
     }
 }
 
-/// A paged attention KV cache implementation that integrates with MLX's `KVCache` protocol.
-///
-/// Uses the `PagedAttentionEngine` for GPU-accelerated attention and the `KVCacheManager`
-/// for efficient GPU memory management. Falls back to `KVCacheSimple` for state tracking.
 public final class PagedMetalKVCache: KVCache, CustomDebugStringConvertible {
-    /// The Metal device used for GPU operations.
     public let device: MTLDevice
-    /// The underlying paged attention engine.
     public let engine: PagedAttentionEngine
-    /// The unique identifier for this sequence.
     public let sequenceID: Int
-    /// The attention layer specification.
     public let layer: PagedLayerSpec
-    /// The KV cache memory manager.
     public let cacheManager: KVCacheManager
-    /// The current token offset in the cache.
     public var offset: Int = 0
-    /// Unlimited maximum size for the KV cache.
     public var maxSize: Int? { nil }
 
     private let fallbackCache = KVCacheSimple()
 
-    /// Creates a new paged Metal KV cache.
-    /// Creates a new paged Metal KV cache.
-    /// - Parameters:
-    ///   - sequenceID: The unique sequence identifier.
-    ///   - layer: The attention layer specification.
-    ///   - maxBlocks: The maximum number of physical cache blocks.
-    ///   - device: The Metal device (defaults to the system default device).
-    ///   - engine: An optional pre-configured engine (creates a new one if nil).
-    /// - Throws: `PagedAttentionMLXError` or `PagedAttentionError` on failure.
     public init(
         sequenceID: Int,
         layer: PagedLayerSpec,
@@ -86,30 +61,16 @@ public final class PagedMetalKVCache: KVCache, CustomDebugStringConvertible {
         try cacheManager.allocateSequence(id: sequenceID)
     }
 
-    /// Returns the inner state of the fallback cache as MLX arrays.
     public func innerState() -> [MLXArray] {
         fallbackCache.innerState()
     }
 
-    /// Updates the fallback cache with new key/value tensors.
-    /// - Parameters:
-    ///   - keys: The key tensor.
-    ///   - values: The value tensor.
-    /// - Returns: A tuple of (keys, values) from the cache.
     public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         let result = fallbackCache.update(keys: keys, values: values)
         offset = fallbackCache.offset
         return result
     }
 
-    /// Executes paged attention for the given queries, automatically selecting prefill or decode.
-    /// - Parameters:
-    ///   - queries: The query tensor [1, heads, seqLen, headDim].
-    ///   - keys: The key tensor [1, kvHeads, seqLen, headDim].
-    ///   - values: The value tensor [1, kvHeads, seqLen, headDim].
-    ///   - mask: The attention mask mode.
-    /// - Returns: The output tensor [1, seqLen, heads, headDim].
-    /// - Throws: `PagedAttentionMLXError` or `PagedAttentionError` on failure.
     public func pagedAttention(
         queries: MLXArray,
         keys: MLXArray,
@@ -192,7 +153,6 @@ public final class PagedMetalKVCache: KVCache, CustomDebugStringConvertible {
         return try mlxArray(from: outputBuffer, seqLen: seqLen).transposed(0, 2, 1, 3)
     }
 
-    /// The state of the fallback cache as MLX arrays.
     public var state: [MLXArray] {
         get { fallbackCache.state }
         set {
@@ -201,7 +161,6 @@ public final class PagedMetalKVCache: KVCache, CustomDebugStringConvertible {
         }
     }
 
-    /// Metadata state used for serialization: ["paged-metal", sequenceID, offset, blockSize].
     public var metaState: [String] {
         get { ["paged-metal", String(sequenceID), String(offset), String(layer.blockSize)] }
         set {
@@ -211,21 +170,13 @@ public final class PagedMetalKVCache: KVCache, CustomDebugStringConvertible {
         }
     }
 
-    /// Whether this cache supports trimming (always false for paged attention).
     public var isTrimmable: Bool { false }
 
-    /// Trims the cache (no-op for paged attention; always returns 0).
     @discardableResult
     public func trim(_ n: Int) -> Int {
         0
     }
 
-    /// Creates an attention mask appropriate for the current cache state.
-    /// - Parameters:
-    ///   - n: The number of new tokens.
-    ///   - windowSize: Optional sliding window constraint.
-    ///   - returnArray: Whether to return a materialized array mask (vs. a mode enum).
-    /// - Returns: The appropriate `ScaledDotProductAttentionMaskMode`.
     public func makeMask(
         n: Int,
         windowSize: Int?,
@@ -240,14 +191,12 @@ public final class PagedMetalKVCache: KVCache, CustomDebugStringConvertible {
         return .causal
     }
 
-    /// Creates a copy of this cache (uses the fallback `KVCacheSimple` implementation).
     public func copy() -> any KVCache {
         let copied = KVCacheSimple()
         copied.state = fallbackCache.state
         return copied
     }
 
-    /// A human-readable description of this cache for debugging.
     public var debugDescription: String {
         "PagedMetalKVCache(sequenceID: \(sequenceID), offset: \(offset), layer: \(layer), stats: \(cacheManager.memoryStats()))"
     }

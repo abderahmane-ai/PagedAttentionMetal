@@ -1,16 +1,6 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// MARK: - FlashAttention Prefill (GQA-aware, Direct Device Reads)
-
-// Grid: (num_kv_heads, (seq_len + 31) / 32, 1)
-// TG: 256 threads = 8 simdgroups × 32 threads
-//   Each simdgroup: 4 Q-rows per Q-head in the GQA group
-//   Each thread: 8 D-elements
-// Total Q-rows per TG: 32, distributed across gqa_ratio heads
-// GQA: one TG handles all Q-heads sharing one KV-head → KV reads × GQA-ratio
-// No threadgroup memory — direct device reads bypass 23 GB/s tgmem bottleneck
-
 static void fa_load8_half(device const half* base, uint off, thread float* v) {
     half4 v0 = *(device const half4*)(base + off);
     half4 v1 = *(device const half4*)(base + off + 4);
@@ -110,7 +100,6 @@ kernel void flash_attention_prefill_f16(
     device half* o_base = O + (q_row * num_heads + head_idx) * head_dim;
     for (uint dd = 0u; dd < 8u; dd++) o_base[d_start + dd] = half(ov[dd] / l_i);
 }
-
 
 kernel void flash_attention_prefill_f32(
     device const float *Q            [[buffer(0)]],
@@ -392,8 +381,6 @@ kernel void flash_attention_mma_f16(
     }
 }
 
-// Performs decode (single query, multi-token attention) with simdgroup_matrix for
-// Q·K dot products and P·V accumulation.
 kernel void flash_decode_mma_f16(
     device const half  *Q                [[buffer(0)]],
     device const half  *K_pool           [[buffer(1)]],
@@ -459,8 +446,6 @@ kernel void flash_decode_mma_f16(
             device const half* K_tok = Kb + lj * num_kv_heads * BD;
             device const half* V_tok = Vb + lj * num_kv_heads * BD;
 
-            // Phase 1: Cooperative Q·K dot product
-            // 32 threads per simdgroup, 4 per head × 2 D-values = 8 D per head
             uint head = lane / 4;
             uint d0 = 2 * (lane % 4);
             uint d1 = d0 + 1;
@@ -481,7 +466,6 @@ kernel void flash_decode_mma_f16(
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // Phase 2: Cross-simdgroup reduction + online softmax
             if (tid < gqa_ratio) {
                 float score = 0.0f;
                 for (uint s = 0; s < 8; s++) score += ps[tid * 8 + s];
@@ -498,7 +482,6 @@ kernel void flash_decode_mma_f16(
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // Phase 3: P·V accumulation (all threads)
             uint ne = gqa_ratio * BD;
             for (uint e = tid; e < ne; e += 256) {
                 uint h = e / BD;
@@ -512,7 +495,6 @@ kernel void flash_decode_mma_f16(
         }
     }
 
-    // Final normalization: divide O by l_i
     uint total_elements = gqa_ratio * BD;
     for (uint o = tid; o < total_elements; o += 256) {
         uint h = o / BD;
@@ -541,8 +523,6 @@ void atomic_add_float(device float* ptr, float value) {
 }
 #endif
 
-// MARK: - Atomic Add Helper (for half, CAS-based)
-
 void atomic_add_half(device half* ptr, half value) {
     device atomic_int* aptr = (device atomic_int*)ptr;
     int expected = atomic_load_explicit(aptr, memory_order_relaxed);
@@ -555,8 +535,6 @@ void atomic_add_half(device half* ptr, half value) {
     } while (!atomic_compare_exchange_weak_explicit(aptr, &expected, desired,
                                                      memory_order_relaxed, memory_order_relaxed));
 }
-
-// MARK: - Atomic Max Helper (for float, CAS-based)
 
 void atomic_max_float(device float* ptr, float value) {
     device atomic_int* aptr = (device atomic_int*)ptr;
@@ -571,8 +549,6 @@ void atomic_max_float(device float* ptr, float value) {
     } while (!atomic_compare_exchange_weak_explicit(aptr, &old_val, new_val,
                                                      memory_order_relaxed, memory_order_relaxed));
 }
-
-// MARK: - FP8 E4M3 Helpers
 
 inline half dequant_fp8(uchar v, half scale) {
     int sign = (v >> 7) & 1;
@@ -640,8 +616,6 @@ inline float simd_dot_product_fp8(const device half* a, const device uchar* b, h
     }
     return sum;
 }
-
-// MARK: - SIMD Vectorized Dot Product Helpers
 
 inline float simd_dot_product(const device float* a, const device float* b, uint head_dim) {
     float sum = 0.0f;
@@ -716,13 +690,6 @@ inline float simd_dot_tg_dev_f16(const threadgroup float* a, uint a_off, const d
     return sum;
 }
 
-
-// MARK: - Paged Attention Tiled (Replaces Split-K)
-
-// Q layout:      [seq_len, num_heads, head_dim]
-// K/V pool layout: [num_physical_blocks, block_size, num_kv_heads, head_dim]
-// Output layout: [seq_len, num_heads, head_dim]
-// Grid: (1, num_qtiles, num_heads), Threadgroup: (head_dim, q_tile_size, 1)
 kernel void paged_attention_tiled(
     device const float   *Q            [[buffer(0)]],
     device const float   *K_pool       [[buffer(1)]],
@@ -797,7 +764,6 @@ kernel void paged_attention_tiled(
     }
 }
 
-
 kernel void paged_attention_tiled_f16(
     device const half    *Q            [[buffer(0)]],
     device const half    *K_pool       [[buffer(1)]],
@@ -871,7 +837,6 @@ kernel void paged_attention_tiled_f16(
         O[(q_row * num_heads + head_idx) * head_dim + col] = half(acc_o / l_i);
     }
 }
-
 
 kernel void paged_attention_tiled_fp8(
     device const half    *Q            [[buffer(0)]],
@@ -951,12 +916,6 @@ kernel void paged_attention_tiled_fp8(
     }
 }
 
-
-// MARK: - Paged Attention Single-Pass (Prefill)
-
-// Q layout:      [seq_len, num_heads, head_dim]
-// K/V pool layout: [num_physical_blocks, block_size, num_kv_heads, head_dim]
-// Output layout: [seq_len, num_heads, head_dim]
 kernel void paged_attention_single(
     device const float   *Q            [[buffer(0)]],
     device const float   *K_pool       [[buffer(1)]],
@@ -1055,7 +1014,6 @@ kernel void paged_attention_single(
     }
 }
 
-
 kernel void paged_attention_single_f16(
     device const half    *Q            [[buffer(0)]],
     device const half    *K_pool       [[buffer(1)]],
@@ -1153,7 +1111,6 @@ kernel void paged_attention_single_f16(
         l_out[row * num_heads + head_idx] = l_i;
     }
 }
-
 
 kernel void paged_attention_single_fp8(
     device const half    *Q            [[buffer(0)]],
@@ -1257,9 +1214,6 @@ kernel void paged_attention_single_fp8(
     }
 }
 
-
-// MARK: - Paged Attention Backward Pass
-
 kernel void paged_attention_backward(
     device const float   *Q            [[buffer(0)]],
     device const float   *K_pool       [[buffer(1)]],
@@ -1359,7 +1313,6 @@ kernel void paged_attention_backward(
 
     dQ[q_offset + d] = dQ_acc;
 }
-
 
 kernel void paged_attention_backward_f16(
     device const half    *Q            [[buffer(0)]],
@@ -1461,12 +1414,6 @@ kernel void paged_attention_backward_f16(
     dQ[q_offset + d] = half(dQ_acc);
 }
 
-
-// MARK: - Paged Decode (Single Token Generation)
-
-// Optimized kernel for generating one new token per sequence
-// Q layout: [batch, num_heads, head_dim]
-// Output layout: [batch, num_heads, head_dim]
 kernel void paged_decode_single(
     device const float *Q                [[buffer(0)]],
     device const float *K_pool           [[buffer(1)]],
@@ -1534,7 +1481,6 @@ kernel void paged_decode_single(
     O[(batch_idx * num_heads + head_idx) * head_dim + d] = acc_o / l_i;
 }
 
-
 kernel void paged_decode_single_f16(
     device const half  *Q                [[buffer(0)]],
     device const half  *K_pool           [[buffer(1)]],
@@ -1601,7 +1547,6 @@ kernel void paged_decode_single_f16(
 
     O[(batch_idx * num_heads + head_idx) * head_dim + d] = half(acc_o / l_i);
 }
-
 
 kernel void paged_decode_single_fp8(
     device const half  *Q                [[buffer(0)]],
@@ -1673,9 +1618,6 @@ kernel void paged_decode_single_fp8(
 
     O[(batch_idx * num_heads + head_idx) * head_dim + d] = half(acc_o / l_i);
 }
-
-
-// MARK: - FlashAttention Decode (GQA-aware, Direct Device Reads, Cooperative Dot)
 
 kernel void flash_decode_f16(
     device const half  *Q                [[buffer(0)]],
@@ -1768,7 +1710,6 @@ kernel void flash_decode_f16(
     }
 }
 
-
 kernel void flash_decode_f32(
     device const float *Q                [[buffer(0)]],
     device const float *K_pool           [[buffer(1)]],
@@ -1860,11 +1801,6 @@ kernel void flash_decode_f32(
     }
 }
 
-
-// MARK: - KV Cache Append (GPU-side cache write)
-
-// Writes new K/V tokens into the paged pool
-// new_keys/values layout: [num_new_tokens, num_kv_heads, head_dim]
 kernel void kv_cache_append(
     device const float *new_keys       [[buffer(0)]],
     device const float *new_values     [[buffer(1)]],
@@ -1900,7 +1836,6 @@ kernel void kv_cache_append(
     K_pool[pool_offset] = new_keys[input_offset];
     V_pool[pool_offset] = new_values[input_offset];
 }
-
 
 kernel void kv_cache_append_f16(
     device const half  *new_keys       [[buffer(0)]],
@@ -1938,7 +1873,6 @@ kernel void kv_cache_append_f16(
     V_pool[pool_offset] = new_values[input_offset];
 }
 
-
 kernel void kv_cache_scale_fp8(
     device const half  *keys            [[buffer(0)]],
     device const half  *values          [[buffer(1)]],
@@ -1969,7 +1903,6 @@ kernel void kv_cache_scale_fp8(
     atomic_max_float(&scratch_max[physical_block * 2 + 0], k_abs);
     atomic_max_float(&scratch_max[physical_block * 2 + 1], v_abs);
 }
-
 
 kernel void kv_cache_append_fp8(
     device const half  *keys            [[buffer(0)]],
@@ -2026,8 +1959,6 @@ kernel void kv_cache_append_fp8(
     k_scale_pool[physical_block] = k_scale;
     v_scale_pool[physical_block] = v_scale;
 }
-
-// MARK: - Fused KV Cache Append + Prefill
 
 kernel void paged_attention_fused_prefill_f32(
     device const float   *Q            [[buffer(0)]],
@@ -2141,7 +2072,6 @@ kernel void paged_attention_fused_prefill_f32(
     }
 }
 
-
 kernel void paged_attention_fused_prefill_f16(
     device const half    *Q            [[buffer(0)]],
     device const half    *raw_K        [[buffer(1)]],
@@ -2253,7 +2183,6 @@ kernel void paged_attention_fused_prefill_f16(
         O[(row * num_heads + head_idx) * head_dim + col] = half(acc_o / l_i);
     }
 }
-
 
 kernel void paged_attention_fused_prefill_fp8(
     device const half    *Q            [[buffer(0)]],

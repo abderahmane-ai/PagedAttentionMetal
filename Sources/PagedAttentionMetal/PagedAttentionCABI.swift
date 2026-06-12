@@ -68,8 +68,6 @@ private func dtype(from raw: Int32) throws -> PagedAttentionDataType {
     return dtype
 }
 
-/// Creates a new PagedAttention engine context.
-/// - Returns: An opaque context pointer, or nil on failure.
 @_cdecl("pam_create_context")
 public func pam_create_context() -> UnsafeMutableRawPointer? {
     do {
@@ -80,8 +78,6 @@ public func pam_create_context() -> UnsafeMutableRawPointer? {
     }
 }
 
-/// Destroys a PagedAttention engine context and releases its resources.
-/// - Parameter contextPointer: The opaque context pointer returned by `pam_create_context`.
 @_cdecl("pam_destroy_context")
 public func pam_destroy_context(_ contextPointer: UnsafeMutableRawPointer?) {
     guard let contextPointer else { return }
@@ -93,15 +89,6 @@ public func pam_last_error(_ contextPointer: UnsafeMutableRawPointer?) -> Unsafe
     context(from: contextPointer)?.lastError.map { UnsafePointer($0) }
 }
 
-/// Creates a new KV cache manager within a PagedAttention context.
-/// - Parameters:
-///   - contextPointer: The opaque context pointer.
-///   - maxBlocks: Total number of physical blocks to allocate.
-///   - blockSize: Number of tokens per block.
-///   - headDim: Dimension of each attention head.
-///   - numKVHeads: Number of key/value heads.
-///   - dataType: Element data type (0 = float32, 1 = float16).
-/// - Returns: An opaque cache pointer, or nil on failure.
 @_cdecl("pam_create_cache")
 public func pam_create_cache(
     _ contextPointer: UnsafeMutableRawPointer?,
@@ -144,20 +131,12 @@ public func pam_create_cache(
     }
 }
 
-/// Destroys a KV cache manager and releases its GPU memory.
-/// - Parameter cachePointer: The opaque cache pointer returned by `pam_create_cache`.
 @_cdecl("pam_destroy_cache")
 public func pam_destroy_cache(_ cachePointer: UnsafeMutableRawPointer?) {
     guard let cachePointer else { return }
     Unmanaged<PAMCache>.fromOpaque(cachePointer).release()
 }
 
-/// Reserves a new sequence slot in the KV cache.
-/// - Parameters:
-///   - contextPointer: The opaque context pointer.
-///   - cachePointer: The opaque cache pointer.
-///   - sequenceID: The unique sequence identifier.
-/// - Returns: 0 on success, -1 on failure (check `pam_last_error`).
 @_cdecl("pam_reserve_sequence")
 public func pam_reserve_sequence(
     _ contextPointer: UnsafeMutableRawPointer?,
@@ -174,13 +153,6 @@ public func pam_reserve_sequence(
     }
 }
 
-/// Appends tokens to a sequence, allocating physical blocks as needed.
-/// - Parameters:
-///   - contextPointer: The opaque context pointer.
-///   - cachePointer: The opaque cache pointer.
-///   - sequenceID: The sequence identifier.
-///   - count: The number of tokens to append.
-/// - Returns: 0 on success, -1 on failure (check `pam_last_error`).
 @_cdecl("pam_append_tokens")
 public func pam_append_tokens(
     _ contextPointer: UnsafeMutableRawPointer?,
@@ -198,10 +170,6 @@ public func pam_append_tokens(
     }
 }
 
-/// Frees a sequence and recycles its GPU memory blocks.
-/// - Parameters:
-///   - cachePointer: The opaque cache pointer.
-///   - sequenceID: The sequence identifier.
 @_cdecl("pam_free_sequence")
 public func pam_free_sequence(
     _ cachePointer: UnsafeMutableRawPointer?,
@@ -210,21 +178,12 @@ public func pam_free_sequence(
     cache(from: cachePointer)?.cache.freeSequence(id: Int(sequenceID))
 }
 
-/// Returns the number of free physical blocks available in the KV cache.
-/// - Parameter cachePointer: The opaque cache pointer.
-/// - Returns: The number of free blocks, or -1 if the cache pointer is invalid.
 @_cdecl("pam_available_blocks")
 public func pam_available_blocks(_ cachePointer: UnsafeMutableRawPointer?) -> Int32 {
     guard let cache = cache(from: cachePointer) else { return -1 }
     return Int32(cache.cache.availableBlocks)
 }
 
-/// Returns the current token length of a sequence.
-/// - Parameters:
-///   - contextPointer: The opaque context pointer.
-///   - cachePointer: The opaque cache pointer.
-///   - sequenceID: The sequence identifier.
-/// - Returns: The sequence length, or -1 on failure (check `pam_last_error`).
 @_cdecl("pam_sequence_length")
 public func pam_sequence_length(
     _ contextPointer: UnsafeMutableRawPointer?,

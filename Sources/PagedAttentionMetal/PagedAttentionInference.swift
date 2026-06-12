@@ -2,49 +2,25 @@ import Foundation
 import Metal
 import os
 
-/// High-level inference orchestration combining the engine, batch KV cache, and scheduler.
-///
-/// Manages the full lifecycle of LLM generation: request admission, prefill, continuous
-/// batching decode, and sequence completion with automatic memory management.
 public final class PagedAttentionInference: @unchecked Sendable {
-    /// The underlying paged attention GPU engine.
     public let engine: PagedAttentionEngine
-    /// The batch KV cache manager.
     public let cache: BatchKVCacheManager
-    /// The continuous batching scheduler.
     public let scheduler: ContinuousBatchingScheduler
 
-    /// The Metal device used for all GPU operations.
     public let device: MTLDevice
-    /// The layer specifications for each transformer layer.
     public let layerSpecs: [PagedLayerSpec]
 
-    /// The maximum number of sequences per batch.
     public let maxBatchSize: Int
-    /// The number of transformer layers.
     public let numLayers: Int
 
-    /// Callback invoked each time a token is generated during decode.
     public var onTokenGenerated: ((Int, Int) -> Void)?
 
     private var prefilledSequences: Set<Int> = []
     private let lock: UnsafeMutablePointer<os_unfair_lock>
     private var _totalTokensGenerated: Int = 0
 
-    /// The number of `step()` calls executed so far.
     public private(set) var stepCount: Int = 0
 
-    /// Creates a new inference orchestrator.
-    /// Creates a new inference orchestrator.
-    /// - Parameters:
-    ///   - device: The Metal device.
-    ///   - maxBlocks: Total number of physical cache blocks to allocate.
-    ///   - blockSize: Number of tokens per physical block.
-    ///   - layerSpecs: Specifications for each transformer layer.
-    ///   - maxBatchSize: Maximum batch size per step.
-    ///   - maxSequences: Maximum number of concurrent sequences.
-    ///   - memoryFraction: Fraction of GPU memory reserved for KV cache.
-    /// - Throws: `PagedAttentionError` if initialization fails.
     public init(
         device: MTLDevice,
         maxBlocks: Int,
@@ -93,18 +69,11 @@ public final class PagedAttentionInference: @unchecked Sendable {
         lock.deallocate()
     }
 
-    /// Adds a new generation request to the inference pipeline.
-    /// - Parameters:
-    ///   - promptTokenCount: The number of tokens in the input prompt.
-    ///   - maxNewTokens: The maximum number of new tokens to generate.
-    /// - Returns: The unique sequence ID, or -1 if the scheduler is full.
     @discardableResult
     public func addRequest(promptTokenCount: Int, maxNewTokens: Int) -> Int {
         scheduler.addRequest(promptTokenCount: promptTokenCount, maxNewTokens: maxNewTokens)
     }
 
-    /// Completes a sequence, marking it done in the scheduler and freeing its KV cache blocks.
-    /// - Parameter id: The sequence ID.
     public func completeSequence(id: Int) {
         scheduler.completeSequence(id: id)
         cache.freeSequence(id: id)
@@ -113,9 +82,6 @@ public final class PagedAttentionInference: @unchecked Sendable {
         os_unfair_lock_unlock(lock)
     }
 
-    /// Executes one scheduling step: prefill for new sequences and decode for ongoing ones.
-    /// - Returns: The batch of sequences processed in this step.
-    /// - Throws: `PagedAttentionError` or `KVCacheError` if GPU execution or memory management fails.
     public func step() throws -> [SchedulerSequence] {
         let batch = scheduler.step()
         guard !batch.isEmpty else { return [] }
@@ -147,8 +113,6 @@ public final class PagedAttentionInference: @unchecked Sendable {
         return batch
     }
 
-    /// Runs all queued sequences to completion.
-    /// - Throws: `PagedAttentionError` or `KVCacheError` if any step fails.
     public func runAll() throws {
         while waitingCount > 0 || runningCount > 0 {
             let batch = try step()
@@ -156,21 +120,15 @@ public final class PagedAttentionInference: @unchecked Sendable {
         }
     }
 
-    /// The number of sequences currently in the waiting state.
     public var waitingCount: Int { scheduler.waitingCount }
-    /// The number of sequences currently in the running state.
     public var runningCount: Int { scheduler.runningCount }
-    /// The number of sequences that have completed generation.
     public var completedCount: Int { scheduler.completedCount }
 
-    /// The total number of tokens generated (prefill + decode) across all sequences.
     public var totalTokensGenerated: Int {
         os_unfair_lock_lock(lock)
         defer { os_unfair_lock_unlock(lock) }
         return _totalTokensGenerated
     }
-
-    // MARK: - Prefill
 
     private func handlePrefill(_ sequences: [SchedulerSequence]) throws {
         for seq in sequences {
@@ -220,8 +178,6 @@ public final class PagedAttentionInference: @unchecked Sendable {
             os_unfair_lock_unlock(lock)
         }
     }
-
-    // MARK: - Decode
 
     private func handleDecode(_ sequences: [SchedulerSequence]) throws {
         let ids = sequences.map { $0.id }
@@ -281,8 +237,6 @@ public final class PagedAttentionInference: @unchecked Sendable {
             }
         }
     }
-
-    // MARK: - Memory Management
 
     private func ensureBlocksAvailable(_ needed: Int) throws {
         guard cache.availableBlocks < needed else { return }

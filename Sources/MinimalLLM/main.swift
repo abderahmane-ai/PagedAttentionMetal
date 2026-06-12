@@ -2,23 +2,19 @@ import Foundation
 import Metal
 import PagedAttentionMetal
 
-/// Minimal synthetic LLM that demonstrates PagedAttention in a realistic generation loop
-/// Uses random weights (no real model) to prove the attention mechanism works correctly
 class SyntheticLLM {
     let device: MTLDevice
     let engine: PagedAttentionEngine
     let cacheManager: KVCacheManager
     
-    // Model config
     let vocabSize = 1000
     let hiddenSize = 512
     let numLayers = 4
     let numHeads = 8
-    let numKVHeads = 2  // GQA
+    let numKVHeads = 2
     let headDim: Int
     let blockSize = 16
     
-    // Dummy weights (normally loaded from checkpoint)
     var embeddings: [Float]
     var qkvWeights: [[Float]]
     var outputWeights: [Float]
@@ -31,7 +27,6 @@ class SyntheticLLM {
         self.engine = try PagedAttentionEngine()
         self.headDim = hiddenSize / numHeads
         
-        // Initialize random weights with local constants
         let vs = vocabSize
         let hs = hiddenSize
         let nl = numLayers
@@ -55,7 +50,6 @@ class SyntheticLLM {
         print("  Config: \(numLayers) layers, \(numHeads) heads, \(numKVHeads) KV heads, dim=\(hiddenSize)")
     }
     
-    /// Embed token IDs to hidden states
     func embed(tokens: [Int]) -> [Float] {
         var hidden = [Float](repeating: 0, count: tokens.count * hiddenSize)
         for (i, token) in tokens.enumerated() {
@@ -67,7 +61,6 @@ class SyntheticLLM {
         return hidden
     }
     
-    /// Project hidden states to Q, K, V
     func projectQKV(hidden: [Float], layer: Int) -> (q: [Float], k: [Float], v: [Float]) {
         let seqLen = hidden.count / hiddenSize
         let weights = qkvWeights[layer]
@@ -76,11 +69,9 @@ class SyntheticLLM {
         var k = [Float](repeating: 0, count: seqLen * numKVHeads * headDim)
         var v = [Float](repeating: 0, count: seqLen * numKVHeads * headDim)
         
-        // Simplified matmul (normally use BLAS)
         for t in 0..<seqLen {
             let hiddenSlice = Array(hidden[t*hiddenSize..<(t+1)*hiddenSize])
             
-            // Q projection
             for h in 0..<numHeads {
                 for d in 0..<headDim {
                     let idx = h * headDim + d
@@ -90,7 +81,6 @@ class SyntheticLLM {
                 }
             }
             
-            // K projection
             for h in 0..<numKVHeads {
                 for d in 0..<headDim {
                     let idx = numHeads * headDim + h * headDim + d
@@ -100,7 +90,6 @@ class SyntheticLLM {
                 }
             }
             
-            // V projection
             for h in 0..<numKVHeads {
                 for d in 0..<headDim {
                     let idx = numHeads * headDim + numKVHeads * headDim + h * headDim + d
@@ -114,7 +103,6 @@ class SyntheticLLM {
         return (q, k, v)
     }
     
-    /// Run attention using PagedAttentionMetal
     func attention(
         q: [Float], k: [Float], v: [Float],
         sequenceID: Int, layer: Int, seqLen: Int, isPrefill: Bool
@@ -123,7 +111,6 @@ class SyntheticLLM {
         let kHalf = k.map { Float16($0) }
         let vHalf = v.map { Float16($0) }
 
-        // Create Metal buffers
         guard let qBuffer = device.makeBuffer(
             bytes: qHalf, length: qHalf.count * MemoryLayout<Float16>.stride, options: .storageModeShared
         ) else { fatalError("Failed to create Q buffer") }
@@ -136,7 +123,6 @@ class SyntheticLLM {
             bytes: vHalf, length: vHalf.count * MemoryLayout<Float16>.stride, options: .storageModeShared
         ) else { fatalError("Failed to create V buffer") }
         
-        // Append K/V to cache
         let blockTable = try cacheManager.getBlockTableBuffer(forSequence: sequenceID)
         let currentLen = try cacheManager.getSequence(id: sequenceID).sequenceLength
         let tokenOffset = currentLen - seqLen
@@ -159,7 +145,6 @@ class SyntheticLLM {
             layer: layerSpec
         ))
         
-        // Run attention
         let outputSize = seqLen * numHeads * headDim
         guard let outputBuffer = device.makeBuffer(
             length: outputSize * MemoryLayout<Float16>.stride, options: .storageModeShared
@@ -196,12 +181,10 @@ class SyntheticLLM {
             ))
         }
         
-        // Read output
         let ptr = outputBuffer.contents().assumingMemoryBound(to: Float16.self)
         return (0..<outputSize).map { Float(ptr[$0]) }
     }
     
-    /// Project attention output to logits
     func projectOutput(hidden: [Float]) -> [Float] {
         let seqLen = hidden.count / hiddenSize
         var logits = [Float](repeating: 0, count: seqLen * vocabSize)
@@ -218,13 +201,10 @@ class SyntheticLLM {
         return logits
     }
     
-    /// Sample next token from logits
     func sample(logits: [Float]) -> Int {
-        // Simple argmax sampling
         return logits.enumerated().max(by: { $0.element < $1.element })?.offset ?? 0
     }
     
-    /// Generate text from prompt tokens
     func generate(promptTokens: [Int], maxNewTokens: Int = 20) throws -> [Int] {
         let sequenceID = 1
         try cacheManager.allocateSequence(id: sequenceID)
@@ -234,7 +214,6 @@ class SyntheticLLM {
         print("\n=== Generation Start ===")
         print("Prompt tokens: \(promptTokens)")
         
-        // Prefill phase
         print("\n[Prefill] Processing \(promptTokens.count) tokens...")
         try cacheManager.appendTokens(toSequence: sequenceID, count: promptTokens.count)
         
@@ -245,7 +224,7 @@ class SyntheticLLM {
                 q: q, k: k, v: v, sequenceID: sequenceID, 
                 layer: layer, seqLen: promptTokens.count, isPrefill: true
             )
-            hidden = attnOut  // Skip residual/norm for simplicity
+            hidden = attnOut
         }
         
         let logits = projectOutput(hidden: hidden)
@@ -254,7 +233,6 @@ class SyntheticLLM {
         tokens.append(nextToken)
         print("  → Generated token: \(nextToken)")
         
-        // Decode phase
         print("\n[Decode] Generating \(maxNewTokens) tokens...")
         for step in 0..<maxNewTokens {
             try cacheManager.appendTokens(toSequence: sequenceID, count: 1)
@@ -287,14 +265,12 @@ class SyntheticLLM {
     }
 }
 
-// Demo
 print("PagedAttentionMetal - Synthetic LLM Demo")
 print("=========================================\n")
 
 do {
     let llm = try SyntheticLLM()
     
-    // Generate from random prompt
     let promptTokens = [42, 123, 456, 789]
     let output = try llm.generate(promptTokens: promptTokens, maxNewTokens: 20)
     

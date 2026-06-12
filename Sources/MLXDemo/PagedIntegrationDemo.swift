@@ -5,14 +5,9 @@ import MLXLMCommon
 import PagedAttentionMetal
 import PagedAttentionMLXSupport
 
-/// Compares standard MLX attention vs paged attention performance.
-///
-/// Both sides prefill seqLen tokens against seqLen K/V; times only the attention kernel.
-/// PagedAttention side measures `engine.prefill` (excluding cache setup).
 func runAttentionComparison(device: MTLDevice, engine: PagedAttentionEngine) {
     print("\n=== Attention Comparison: MLX vs PagedAttention (Prefill) ===\n")
 
-    // LLaMA 3.2 1B dimensions
     let headDim = 64
     let numHeads = 8
     let numKVHeads = 8
@@ -34,7 +29,6 @@ func runAttentionComparison(device: MTLDevice, engine: PagedAttentionEngine) {
         let batch = 1
         let seed = UInt64(seqLen)
 
-        // Generate synthetic Q, K, V matching MLX's [B, nHeads, seqLen, headDim] layout
         let q = MLXRandom.uniform(0..<1, [batch, numHeads, seqLen, headDim], key: MLXRandom.key(seed + 0))
         let k = MLXRandom.uniform(0..<1, [batch, numKVHeads, seqLen, headDim], key: MLXRandom.key(seed + 1))
         let v = MLXRandom.uniform(0..<1, [batch, numKVHeads, seqLen, headDim], key: MLXRandom.key(seed + 2))
@@ -42,7 +36,6 @@ func runAttentionComparison(device: MTLDevice, engine: PagedAttentionEngine) {
 
         let scale = 1.0 / sqrt(Float(headDim))
 
-        // ── Standard MLX attention ──────────────────────────────
         var totalMLX: Double = 0
         let warmup = 3
         let samples = 20
@@ -62,8 +55,6 @@ func runAttentionComparison(device: MTLDevice, engine: PagedAttentionEngine) {
         }
         let avgMLX = totalMLX / Double(samples)
 
-        // ── PagedAttention ───────────────────────────────────────
-        // Create cache + pre-append K/V once (outside timed section)
         let cache = KVCacheManager(
             device: device,
             maxBlocks: maxBlocks * 2,
@@ -75,7 +66,6 @@ func runAttentionComparison(device: MTLDevice, engine: PagedAttentionEngine) {
         try! cache.allocateSequence(id: 1)
         try! cache.appendTokens(toSequence: 1, count: seqLen)
 
-        // MLX [B, nHeads, seqLen, headDim] -> Metal [seqLen, nHeads, headDim] (transposed(0,2,1,3))
         let qMetal = q.transposed(0, 2, 1, 3)
         let kMetal = k.transposed(0, 2, 1, 3)
         let vMetal = v.transposed(0, 2, 1, 3)
@@ -89,7 +79,6 @@ func runAttentionComparison(device: MTLDevice, engine: PagedAttentionEngine) {
             options: .storageModeShared
         )!
 
-        // Append K/V to cache (setup, not timed)
         try! engine.appendToCache(PagedKVAppendRequest(
             keys: kBuffer, values: vBuffer,
             kPool: cache.kPoolBuffer, vPool: cache.vPoolBuffer,
@@ -136,7 +125,6 @@ func runAttentionComparison(device: MTLDevice, engine: PagedAttentionEngine) {
     print("At longer contexts, Paged's tiled kernel avoids O(n²) memory.\n")
 }
 
-/// Creates a Metal buffer from an MLX array by copying the raw bytes.
 func pagedMetalBuffer(device: MTLDevice, from array: MLXArray) throws -> MTLBuffer {
     guard let buffer = array.asMTLBuffer(device: device, noCopy: false) else {
         throw PagedAttentionMLXError.bufferCreationFailed("array")

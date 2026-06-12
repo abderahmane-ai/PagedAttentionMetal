@@ -3,8 +3,6 @@ import Metal
 import os
 import os.lock
 
-// MARK: - Command Buffer Manager
-
 private final class CommandBufferManager: @unchecked Sendable {
     private let commandQueue: MTLCommandQueue
     private let semaphore: DispatchSemaphore
@@ -49,19 +47,11 @@ private final class CommandBufferManager: @unchecked Sendable {
     }
 }
 
-/// High-performance paged attention engine backed by Apple Metal GPU compute.
-///
-/// Provides prefill, decode, KV cache append, and backward pass operations using
-/// PagedAttention — a virtual memory system for transformer KV caches. Supports
-/// FP32, FP16, and FP8 data types, sliding window attention, and automatic tiled
-/// dispatch for long sequences.
 public class PagedAttentionEngine: @unchecked Sendable {
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private let cmdBufManager: CommandBufferManager
 
-    // Prefill kernels
-    // Prefill kernels
     private let flashPrefillPipelineMMA: [[MTLComputePipelineState]]
     private let flashPrefillPipelineF16: MTLComputePipelineState
     private let flashPrefillPipelineF32: MTLComputePipelineState
@@ -72,7 +62,6 @@ public class PagedAttentionEngine: @unchecked Sendable {
     private let tiledPipelineF16: MTLComputePipelineState
     private let tiledPipelineFP8: MTLComputePipelineState
 
-    // Decode kernels
     private let flashDecodePipelineMMA: [MTLComputePipelineState]
     private let flashDecodePipelineF16: MTLComputePipelineState
     private let flashDecodePipelineF32: MTLComputePipelineState
@@ -80,34 +69,24 @@ public class PagedAttentionEngine: @unchecked Sendable {
     private let decodePipelineF16: MTLComputePipelineState
     private let decodePipelineFP8: MTLComputePipelineState
 
-    // KV cache append kernels
     private let appendPipeline: MTLComputePipelineState
     private let appendPipelineF16: MTLComputePipelineState
     private let appendScaleFP8: MTLComputePipelineState
     private let appendPipelineFP8: MTLComputePipelineState
 
-    // Backward kernels
     private let backwardPipeline: MTLComputePipelineState
     private let backwardPipelineF16: MTLComputePipelineState
 
-    // Fused append + prefill kernels
     private let fusedPrefillPipelineF32: MTLComputePipelineState
     private let fusedPrefillPipelineF16: MTLComputePipelineState
     private let fusedPrefillPipelineFP8: MTLComputePipelineState
 
-    /// Sequence length above which the engine switches from single-pass to tiled dispatch.
     public var splitThreshold: Int = 1024
-    /// Default sliding window size used when a per-call window size is not specified.
     public var defaultWindowSize: Int = 0
-    /// Default chunk size for chunked prefill (0 disables chunking).
     public var defaultChunkSize: Int = 0
-    /// Fraction of total GPU memory reserved for the KV cache.
     public private(set) var memoryFraction: Float = 0.75
-    /// Recommended number of KV cache blocks based on available GPU memory.
     public private(set) var recommendedBlockCount: Int = 0
-    /// Maximum number of retry attempts for transient GPU failures.
     public var maxRetries: Int = 3
-    /// When true, GPU failures produce zeroed output instead of throwing.
     public var enableGracefulDegradation: Bool = true
 
     private var _lastStats: PagedAttentionStats = .empty
@@ -115,21 +94,18 @@ public class PagedAttentionEngine: @unchecked Sendable {
     private var consecutiveFailures: Int = 0
     private let lock = OSAllocatedUnfairLock()
 
-    /// Statistics from the most recently completed engine operation.
     public var lastStats: PagedAttentionStats {
         lock.lock()
         defer { lock.unlock() }
         return _lastStats
     }
 
-    /// The error (if any) from the most recent engine operation.
     public var lastError: PagedAttentionError? {
         lock.lock()
         defer { lock.unlock() }
         return _lastError
     }
 
-    /// The default Metal library loaded from the module bundle or source directory.
     public static var defaultLibrary: MTLLibrary {
         if let url = Bundle.module.url(forResource: "kernels", withExtension: "metal"),
            let source = try? String(contentsOf: url),
@@ -148,10 +124,6 @@ public class PagedAttentionEngine: @unchecked Sendable {
         fatalError("kernels.metal not found in bundle or source directory")
     }
 
-    /// Loads the Metal kernel library for the given device.
-    /// - Parameter device: The Metal device to compile for.
-    /// - Returns: The compiled Metal library containing all attention kernels.
-    /// - Throws: `PagedAttentionError.libraryInitializationFailed` if loading fails.
     public static func makeDefaultLibrary(device: MTLDevice) throws -> MTLLibrary {
         if let url = Bundle.module.url(forResource: "kernels", withExtension: "metal") {
             do {
@@ -171,16 +143,6 @@ public class PagedAttentionEngine: @unchecked Sendable {
         }
     }
 
-    /// Calculates the maximum number of KV cache blocks that fit within the given memory budget.
-    /// - Parameters:
-    ///   - device: The Metal device to query for available memory.
-    ///   - blockSize: Number of tokens per block.
-    ///   - numKVHeads: Number of key/value heads.
-    ///   - headDim: Dimension of each attention head.
-    ///   - dataType: Element data type for the cache.
-    ///   - memoryFraction: Fraction of `recommendedMaxWorkingSetSize` to use.
-    ///   - layerCount: Number of transformer layers sharing the cache.
-    /// - Returns: The recommended number of blocks.
     public static func recommendedMaxBlocks(
         device: MTLDevice,
         blockSize: Int,
@@ -199,9 +161,6 @@ public class PagedAttentionEngine: @unchecked Sendable {
         return max(1, maxBlocks)
     }
 
-    /// Returns a human-readable string describing the GPU hardware capabilities.
-    /// - Parameter device: The Metal device to inspect.
-    /// - Returns: A formatted string with GPU name, memory limits, and Apple GPU family support.
     public static func gpuInfo(device: MTLDevice) -> String {
         var families = [String]()
         let appleFamilies: [(MTLGPUFamily, String)] = [
@@ -229,8 +188,6 @@ public class PagedAttentionEngine: @unchecked Sendable {
         """
     }
 
-    /// Creates a new engine, initializing the Metal device, command queue, and all GPU pipelines.
-    /// - Throws: `PagedAttentionError` if device initialization or pipeline creation fails.
     public init() throws {
         guard let device = MTLCreateSystemDefaultDevice(),
               let queue = device.makeCommandQueue() else {
@@ -318,15 +275,6 @@ public class PagedAttentionEngine: @unchecked Sendable {
         self.fusedPrefillPipelineFP8 = try device.makeComputePipelineState(function: funcFusedFP8)
     }
 
-    /// Creates a new engine with an automatically calculated block count based on available GPU memory.
-    /// - Parameters:
-    ///   - blockSize: Number of tokens per physical block.
-    ///   - headDim: Dimension of each attention head.
-    ///   - numHeads: Number of query heads.
-    ///   - numKVHeads: Number of key/value heads.
-    ///   - dataType: Element data type for the cache.
-    ///   - memoryFraction: Fraction of GPU memory to reserve for the KV cache.
-    /// - Throws: `PagedAttentionError` if initialization fails.
     public convenience init(
         blockSize: Int = 16,
         headDim: Int,
@@ -351,8 +299,6 @@ public class PagedAttentionEngine: @unchecked Sendable {
         self.recommendedBlockCount = maxBlocks
     }
 
-    // MARK: - OSLog & Observability
-
     private static let log = OSLog(subsystem: "com.pagedattentionmetal", category: "engine")
     private static let perfLog = OSLog(subsystem: "com.pagedattentionmetal", category: "performance")
 
@@ -364,14 +310,6 @@ public class PagedAttentionEngine: @unchecked Sendable {
         os_log(.error, log: Self.log, "%{public}s", message)
     }
 
-    // MARK: - Retry & Recovery
-
-    /// Executes a GPU operation with retry logic and exponential backoff.
-    /// - Parameters:
-    ///   - operation: A human-readable name for the operation (used in error reporting).
-    ///   - block: The closure to execute.
-    /// - Returns: The result of the closure.
-    /// - Throws: The last error after exhausting retries, or `recurringError` if the circuit breaker trips.
     private func withRetry<T>(operation: String, block: () throws -> T) throws -> T {
         var lastError: Error?
         for attempt in 0..<maxRetries {
@@ -399,14 +337,6 @@ public class PagedAttentionEngine: @unchecked Sendable {
         throw lastError!
     }
 
-    // MARK: - Checked Production API
-
-    /// Executes a paged attention prefill for a single sequence.
-    ///
-    /// Automatically selects single-pass or tiled dispatch based on sequence length
-    /// and the `splitThreshold` property.
-    /// - Parameter request: The prefill parameters.
-    /// - Throws: `PagedAttentionError` if validation or GPU execution fails.
     public func prefill(_ request: PagedAttentionPrefillRequest) throws {
         try request.layer.validate()
         try validatePrefill(request)
@@ -529,9 +459,6 @@ public class PagedAttentionEngine: @unchecked Sendable {
         lock.unlock()
     }
 
-    /// Executes a batched paged attention decode step, generating one new token per sequence.
-    /// - Parameter request: The decode parameters.
-    /// - Throws: `PagedAttentionError` if validation or GPU execution fails.
     public func decode(_ request: PagedAttentionDecodeRequest) throws {
         try request.layer.validate()
         try validateDecode(request)
@@ -581,9 +508,6 @@ public class PagedAttentionEngine: @unchecked Sendable {
         lock.unlock()
     }
 
-    /// Appends key/value data into the paged KV cache for a single sequence.
-    /// - Parameter request: The append parameters.
-    /// - Throws: `PagedAttentionError` if validation or GPU execution fails.
     public func appendToCache(_ request: PagedKVAppendRequest) throws {
         try request.layer.validate()
         try validateAppend(request)
@@ -629,11 +553,6 @@ public class PagedAttentionEngine: @unchecked Sendable {
         lock.unlock()
     }
 
-    // MARK: - Fused Append + Prefill
-
-    /// Fused KV cache append and paged attention prefill executed in a single GPU kernel.
-    /// - Parameter request: The fused prefill parameters.
-    /// - Throws: `PagedAttentionError` if validation or GPU execution fails.
     public func fusedPrefill(_ request: PagedAttentionFusedPrefillRequest) throws {
         try request.layer.validate()
         guard request.seqLen > 0 else {
@@ -713,28 +632,6 @@ public class PagedAttentionEngine: @unchecked Sendable {
         lock.unlock()
     }
 
-    // MARK: - Prefill (Process full prompt)
-
-    /// Executes a paged attention prefill using individual parameters rather than a request struct.
-    ///
-    /// When `chunkSize` is greater than zero and `seqLen` exceeds it, the prefill is
-    /// automatically split into chunks to reduce peak memory usage.
-    /// - Parameters:
-    ///   - q: Query buffer [seqLen × numHeads × headDim].
-    ///   - kPool: Key cache pool buffer.
-    ///   - vPool: Value cache pool buffer.
-    ///   - blockTable: Block table buffer.
-    ///   - seqLen: Number of input tokens.
-    ///   - headDim: Dimension of each attention head.
-    ///   - numHeads: Number of query heads.
-    ///   - numKVHeads: Number of key/value heads.
-    ///   - blockSize: Tokens per physical block.
-    ///   - causal: Whether to apply causal masking.
-    ///   - output: Output buffer for the attention result.
-    ///   - dataType: Element data type.
-    ///   - windowSize: Sliding window size (0 disables windowing).
-    ///   - chunkSize: Chunk size for chunked prefill (0 disables chunking).
-    /// - Throws: `PagedAttentionError` if validation or execution fails.
     public func prefill(
         q: MTLBuffer,
         kPool: MTLBuffer,
@@ -959,7 +856,6 @@ public class PagedAttentionEngine: @unchecked Sendable {
             enc.setBytes(&blockSizeVar, length: 4, index: 8)
             enc.setBytes(&windowStartVar, length: 4, index: 9)
 
-            // Threadgroup memory allocated dynamically from headDim
             let hd = headDim
             enc.setThreadgroupMemoryLength(32 * hd * MemoryLayout<Float16>.stride, index: 0)
             enc.setThreadgroupMemoryLength(32 * 16 * MemoryLayout<Float16>.stride, index: 1)
@@ -1032,25 +928,6 @@ public class PagedAttentionEngine: @unchecked Sendable {
         }
     }
 
-    // MARK: - Decode (Generate one new token per sequence)
-
-    /// Executes a batched decode step using individual parameters.
-    /// - Parameters:
-    ///   - q: Query buffer [batchSize × numHeads × headDim].
-    ///   - kPool: Key cache pool buffer.
-    ///   - vPool: Value cache pool buffer.
-    ///   - blockTables: Batched block tables buffer [batchSize × maxNumBlocks].
-    ///   - seqLengths: Per-sequence lengths buffer [batchSize × UInt32].
-    ///   - batchSize: Number of sequences in the batch.
-    ///   - maxNumBlocks: Maximum block count across all sequences.
-    ///   - headDim: Dimension of each attention head.
-    ///   - numHeads: Number of query heads.
-    ///   - numKVHeads: Number of key/value heads.
-    ///   - blockSize: Tokens per physical block.
-    ///   - output: Output buffer for decoded logits.
-    ///   - dataType: Element data type.
-    ///   - windowSize: Sliding window size (0 disables windowing).
-    /// - Throws: `PagedAttentionError` if validation or execution fails.
     public func decode(
         q: MTLBuffer,
         kPool: MTLBuffer,
@@ -1205,24 +1082,6 @@ public class PagedAttentionEngine: @unchecked Sendable {
         }
     }
 
-
-    // MARK: - KV Cache Append
-
-    /// Appends key/value data into the paged KV cache using individual parameters.
-    /// - Parameters:
-    ///   - keys: New keys buffer [numNewTokens × numKVHeads × headDim].
-    ///   - values: New values buffer [numNewTokens × numKVHeads × headDim].
-    ///   - kPool: Key cache pool buffer.
-    ///   - vPool: Value cache pool buffer.
-    ///   - blockTable: Block table buffer.
-    ///   - tokenOffset: Starting token position in the sequence.
-    ///   - numNewTokens: Number of new tokens to append.
-    ///   - numKVHeads: Number of key/value heads.
-    ///   - headDim: Dimension of each attention head.
-    ///   - blockSize: Tokens per physical block.
-    ///   - dataType: Element data type.
-    ///   - windowSize: Sliding window size (0 disables windowing).
-    /// - Throws: `PagedAttentionError` if validation or execution fails.
     public func appendToCache(
         keys: MTLBuffer,
         values: MTLBuffer,
@@ -1395,8 +1254,6 @@ public class PagedAttentionEngine: @unchecked Sendable {
         }
     }
 
-    // MARK: - Backward Pass
-
     public func backward(
         q: MTLBuffer,
         kPool: MTLBuffer,
@@ -1457,8 +1314,6 @@ public class PagedAttentionEngine: @unchecked Sendable {
         }
     }
 
-    // MARK: - Pipeline Selectors
-
     private func singlePassPipelineFor(dataType: PagedAttentionDataType) -> MTLComputePipelineState {
         switch dataType {
         case .float32: return singlePassPipeline
@@ -1490,20 +1345,6 @@ public class PagedAttentionEngine: @unchecked Sendable {
         }
     }
 
-    // MARK: - Multi-Layer Batching
-
-    /// Executes paged attention prefill across multiple transformer layers in a single command buffer.
-    /// - Parameters:
-    ///   - qBuffers: Per-layer query buffers.
-    ///   - kPool: Shared key cache pool buffer.
-    ///   - vPool: Shared value cache pool buffer.
-    ///   - blockTable: Block table buffer (shared across layers).
-    ///   - outputBuffers: Per-layer output buffers.
-    ///   - seqLen: Number of input tokens.
-    ///   - layers: Array of layer specifications (one per transformer layer).
-    ///   - causal: Whether to apply causal masking.
-    ///   - windowSize: Sliding window size (0 disables windowing).
-    /// - Throws: `PagedAttentionError` if validation or execution fails.
     public func prefillLayers(
         qBuffers: [MTLBuffer],
         kPool: MTLBuffer,
@@ -1709,19 +1550,6 @@ public class PagedAttentionEngine: @unchecked Sendable {
         }
     }
 
-    /// Executes batched decode across multiple transformer layers in a single command buffer.
-    /// - Parameters:
-    ///   - qBuffers: Per-layer query buffers.
-    ///   - kPool: Shared key cache pool buffer.
-    ///   - vPool: Shared value cache pool buffer.
-    ///   - blockTables: Batched block tables buffer.
-    ///   - seqLengths: Per-sequence lengths buffer.
-    ///   - outputBuffers: Per-layer output buffers.
-    ///   - batchSize: Number of sequences in the batch.
-    ///   - maxNumBlocks: Maximum block count across all sequences.
-    ///   - layers: Array of layer specifications.
-    ///   - windowSize: Sliding window size (0 disables windowing).
-    /// - Throws: `PagedAttentionError` if validation or execution fails.
     public func decodeLayers(
         qBuffers: [MTLBuffer],
         kPool: MTLBuffer,
@@ -1823,17 +1651,6 @@ public class PagedAttentionEngine: @unchecked Sendable {
         }
     }
 
-    /// Appends key/value data across multiple transformer layers in a single command buffer.
-    /// - Parameters:
-    ///   - keys: Per-layer key buffers.
-    ///   - values: Per-layer value buffers.
-    ///   - kPool: Shared key cache pool buffer.
-    ///   - vPool: Shared value cache pool buffer.
-    ///   - blockTable: Block table buffer (shared across layers).
-    ///   - tokenOffset: Starting token position in the sequence.
-    ///   - numNewTokens: Number of new tokens to append.
-    ///   - layers: Array of layer specifications.
-    /// - Throws: `PagedAttentionError` if validation or execution fails.
     public func appendLayers(
         keys: [MTLBuffer],
         values: [MTLBuffer],
@@ -1894,8 +1711,6 @@ public class PagedAttentionEngine: @unchecked Sendable {
             throw PagedAttentionError.commandExecutionFailed(last.error?.localizedDescription ?? "Metal error in appendLayers")
         }
     }
-
-    // MARK: - Validation
 
     private func validatePrefill(_ request: PagedAttentionPrefillRequest) throws {
         guard request.seqLen > 0 else {
