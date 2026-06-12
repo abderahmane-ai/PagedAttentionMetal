@@ -61,6 +61,10 @@ public class PagedAttentionEngine: @unchecked Sendable {
     private let cmdBufManager: CommandBufferManager
 
     // Prefill kernels
+    // Prefill kernels
+    private let flashPrefillPipelineMMA: [[MTLComputePipelineState]]
+    private let flashPrefillPipelineF16: MTLComputePipelineState
+    private let flashPrefillPipelineF32: MTLComputePipelineState
     private let singlePassPipeline: MTLComputePipelineState
     private let singlePassPipelineF16: MTLComputePipelineState
     private let singlePassPipelineFP8: MTLComputePipelineState
@@ -69,6 +73,9 @@ public class PagedAttentionEngine: @unchecked Sendable {
     private let tiledPipelineFP8: MTLComputePipelineState
 
     // Decode kernels
+    private let flashDecodePipelineMMA: [MTLComputePipelineState]
+    private let flashDecodePipelineF16: MTLComputePipelineState
+    private let flashDecodePipelineF32: MTLComputePipelineState
     private let decodePipeline: MTLComputePipelineState
     private let decodePipelineF16: MTLComputePipelineState
     private let decodePipelineFP8: MTLComputePipelineState
@@ -236,7 +243,12 @@ public class PagedAttentionEngine: @unchecked Sendable {
 
         let library = try PagedAttentionEngine.makeDefaultLibrary(device: device)
 
-        guard let funcSingle = library.makeFunction(name: "paged_attention_single"),
+        guard let funcFlashF16 = library.makeFunction(name: "flash_attention_prefill_f16"),
+              let funcFlashF32 = library.makeFunction(name: "flash_attention_prefill_f32"),
+              let funcFlashDecodeMMA = library.makeFunction(name: "flash_decode_mma_f16"),
+              let funcFlashDecodeF16 = library.makeFunction(name: "flash_decode_f16"),
+              let funcFlashDecodeF32 = library.makeFunction(name: "flash_decode_f32"),
+              let funcSingle = library.makeFunction(name: "paged_attention_single"),
               let funcSingleF16 = library.makeFunction(name: "paged_attention_single_f16"),
               let funcSingleFP8 = library.makeFunction(name: "paged_attention_single_fp8"),
               let funcTiled = library.makeFunction(name: "paged_attention_tiled"),
@@ -257,6 +269,35 @@ public class PagedAttentionEngine: @unchecked Sendable {
             throw PagedAttentionError.pipelineCreationFailed("one or more kernels")
         }
 
+        let causalVals: [UInt32] = [0, 1]
+        let headDimVals: [UInt32] = [64, 128]
+        self.flashPrefillPipelineMMA = try causalVals.map { causalVal in
+            try headDimVals.map { hdVal in
+                let cv = MTLFunctionConstantValues()
+                var v = causalVal
+                cv.setConstantValue(&v, type: .uint, index: 0)
+                var h = hdVal
+                cv.setConstantValue(&h, type: .uint, index: 1)
+                guard let f = try? library.makeFunction(name: "flash_attention_mma_f16", constantValues: cv) else {
+                    throw PagedAttentionError.pipelineCreationFailed("MMA prefill function constant variant causal=\(causalVal) headDim=\(hdVal)")
+                }
+                return try device.makeComputePipelineState(function: f)
+            }
+        }
+        self.flashPrefillPipelineF16 = try device.makeComputePipelineState(function: funcFlashF16)
+        self.flashPrefillPipelineF32 = try device.makeComputePipelineState(function: funcFlashF32)
+        let decodeHDVals: [UInt32] = [64]
+        self.flashDecodePipelineMMA = try decodeHDVals.map { hdVal in
+            let cv = MTLFunctionConstantValues()
+            var h = hdVal
+            cv.setConstantValue(&h, type: .uint, index: 1)
+            guard let f = try? library.makeFunction(name: "flash_decode_mma_f16", constantValues: cv) else {
+                throw PagedAttentionError.pipelineCreationFailed("decode MMA function constant variant headDim=\(hdVal)")
+            }
+            return try device.makeComputePipelineState(function: f)
+        }
+        self.flashDecodePipelineF16 = try device.makeComputePipelineState(function: funcFlashDecodeF16)
+        self.flashDecodePipelineF32 = try device.makeComputePipelineState(function: funcFlashDecodeF32)
         self.singlePassPipeline = try device.makeComputePipelineState(function: funcSingle)
         self.singlePassPipelineF16 = try device.makeComputePipelineState(function: funcSingleF16)
         self.singlePassPipelineFP8 = try device.makeComputePipelineState(function: funcSingleFP8)
@@ -381,11 +422,60 @@ public class PagedAttentionEngine: @unchecked Sendable {
         }
     }
 
+    private func shouldUseMMAPrefill(headDim: Int, dataType: PagedAttentionDataType) -> Bool {
+        guard headDim <= 256 && headDim % 64 == 0 else { return false }
+        switch dataType {
+        case .float16: return true
+        default: return false
+        }
+    }
+
+    private func shouldUseFlashPrefill(headDim: Int, dataType: PagedAttentionDataType) -> Bool {
+        guard headDim <= 64 else { return false }
+        switch dataType {
+        case .float16, .float32: return true
+        case .float8: return false
+        }
+    }
+
     private func prefillGPU(_ request: PagedAttentionPrefillRequest) throws {
-        let useTiledPass = shouldUseTiledPass(seqLen: request.seqLen, layer: request.layer)
+        let useMMA = shouldUseMMAPrefill(headDim: request.layer.headDim, dataType: request.layer.dataType)
+        let useFlash = !useMMA && shouldUseFlashPrefill(headDim: request.layer.headDim, dataType: request.layer.dataType)
+        let useTiledPass = !useMMA && !useFlash && shouldUseTiledPass(seqLen: request.seqLen, layer: request.layer)
         let start = CFAbsoluteTimeGetCurrent()
 
-        if useTiledPass {
+        if useMMA {
+            try prefillMMA(
+                q: request.q,
+                kPool: request.kPool,
+                vPool: request.vPool,
+                blockTable: request.blockTable,
+                seqLen: request.seqLen,
+                headDim: request.layer.headDim,
+                numHeads: request.layer.numHeads,
+                numKVHeads: request.layer.numKVHeads,
+                blockSize: request.layer.blockSize,
+                causal: request.causal,
+                output: request.output,
+                windowSize: request.layer.windowSize
+            )
+        } else if useFlash {
+            try prefillFlash(
+                q: request.q,
+                kPool: request.kPool,
+                vPool: request.vPool,
+                blockTable: request.blockTable,
+                seqLen: request.seqLen,
+                headDim: request.layer.headDim,
+                numHeads: request.layer.numHeads,
+                numKVHeads: request.layer.numKVHeads,
+                blockSize: request.layer.blockSize,
+                causal: request.causal,
+                output: request.output,
+                dataType: request.layer.dataType,
+                windowSize: request.layer.windowSize
+            )
+        } else if useTiledPass {
             try prefillTiledPass(
                 q: request.q,
                 kPool: request.kPool,
@@ -425,8 +515,9 @@ public class PagedAttentionEngine: @unchecked Sendable {
 
         let numBlocks = logicalBlocks(tokenCount: request.seqLen, blockSize: request.layer.blockSize)
         lock.lock()
+        let opName: PagedAttentionStats.Operation = useMMA ? .prefillSinglePass : (useFlash ? .prefillSinglePass : (useTiledPass ? .prefillTiledPass : .prefillSinglePass))
         _lastStats = PagedAttentionStats(
-            operation: useTiledPass ? .prefillTiledPass : .prefillSinglePass,
+            operation: opName,
             batchSize: 1,
             sequenceLength: request.seqLen,
             numBlocks: numBlocks,
@@ -836,6 +927,111 @@ public class PagedAttentionEngine: @unchecked Sendable {
         }
     }
 
+    private func prefillMMA(
+        q: MTLBuffer, kPool: MTLBuffer, vPool: MTLBuffer, blockTable: MTLBuffer,
+        seqLen: Int, headDim: Int, numHeads: Int, numKVHeads: Int, blockSize: Int,
+        causal: Bool, output: MTLBuffer, windowSize: Int = 0
+    ) throws {
+        try withRetry(operation: "prefillMMA") {
+            let cb = cmdBufManager.next()
+            guard let enc = cb.makeComputeCommandEncoder() else {
+                throw PagedAttentionError.commandEncodingFailed("failed to create MMA prefill encoder")
+            }
+
+            let causalIdx = causal ? 1 : 0
+            let hdIdx = headDim == 128 ? 1 : 0
+            enc.setComputePipelineState(flashPrefillPipelineMMA[causalIdx][hdIdx])
+            enc.setBuffer(q, offset: 0, index: 0)
+            enc.setBuffer(kPool, offset: 0, index: 1)
+            enc.setBuffer(vPool, offset: 0, index: 2)
+            enc.setBuffer(blockTable, offset: 0, index: 3)
+            enc.setBuffer(output, offset: 0, index: 4)
+
+            var seqLenVar = UInt32(seqLen)
+            var numHeadsVar = UInt32(numHeads)
+            var numKVVar = UInt32(numKVHeads)
+            var blockSizeVar = UInt32(blockSize)
+            var windowStartVar = UInt32(windowSize > 0 ? max(0, seqLen - windowSize) : 0)
+
+            enc.setBytes(&seqLenVar, length: 4, index: 5)
+            enc.setBytes(&numHeadsVar, length: 4, index: 6)
+            enc.setBytes(&numKVVar, length: 4, index: 7)
+            enc.setBytes(&blockSizeVar, length: 4, index: 8)
+            enc.setBytes(&windowStartVar, length: 4, index: 9)
+
+            // Threadgroup memory allocated dynamically from headDim
+            let hd = headDim
+            enc.setThreadgroupMemoryLength(32 * hd * MemoryLayout<Float16>.stride, index: 0)
+            enc.setThreadgroupMemoryLength(32 * 16 * MemoryLayout<Float16>.stride, index: 1)
+            enc.setThreadgroupMemoryLength(32 * 16 * MemoryLayout<Float>.stride, index: 2)
+            enc.setThreadgroupMemoryLength(32 * hd * MemoryLayout<Float>.stride, index: 3)
+            enc.setThreadgroupMemoryLength(64 * MemoryLayout<Float>.stride, index: 4)
+
+            let gqaRatio = numHeads / numKVHeads
+            let rowsPerHead = 32 / gqaRatio
+            let numQTiles = (seqLen + rowsPerHead - 1) / rowsPerHead
+            let threadsPerTG = MTLSize(width: 256, height: 1, depth: 1)
+            let threadgroups = MTLSize(width: numKVHeads, height: numQTiles, depth: 1)
+
+            enc.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerTG)
+            enc.endEncoding()
+            try commitAndWait(cb)
+        }
+    }
+
+    private func prefillFlash(
+        q: MTLBuffer, kPool: MTLBuffer, vPool: MTLBuffer, blockTable: MTLBuffer,
+        seqLen: Int, headDim: Int, numHeads: Int, numKVHeads: Int, blockSize: Int,
+        causal: Bool, output: MTLBuffer, dataType: PagedAttentionDataType,
+        windowSize: Int = 0
+    ) throws {
+        try withRetry(operation: "prefillFlash") {
+            let cb = cmdBufManager.next()
+            guard let enc = cb.makeComputeCommandEncoder() else {
+                throw PagedAttentionError.commandEncodingFailed("failed to create flash prefill encoder")
+            }
+
+            let pipeline: MTLComputePipelineState
+            switch dataType {
+            case .float16: pipeline = flashPrefillPipelineF16
+            case .float32: pipeline = flashPrefillPipelineF32
+            case .float8: throw PagedAttentionError.invalidConfiguration("FlashAttention does not support FP8")
+            }
+
+            enc.setComputePipelineState(pipeline)
+            enc.setBuffer(q, offset: 0, index: 0)
+            enc.setBuffer(kPool, offset: 0, index: 1)
+            enc.setBuffer(vPool, offset: 0, index: 2)
+            enc.setBuffer(blockTable, offset: 0, index: 3)
+            enc.setBuffer(output, offset: 0, index: 4)
+
+            var seqLenVar = UInt32(seqLen)
+            var headDimVar = UInt32(headDim)
+            var numHeadsVar = UInt32(numHeads)
+            var numKVVar = UInt32(numKVHeads)
+            var blockSizeVar = UInt32(blockSize)
+            var causalVar = UInt32(causal ? 1 : 0)
+            var windowStartVar = UInt32(windowSize > 0 ? max(0, seqLen - windowSize) : 0)
+
+            enc.setBytes(&seqLenVar, length: 4, index: 5)
+            enc.setBytes(&headDimVar, length: 4, index: 6)
+            enc.setBytes(&numHeadsVar, length: 4, index: 7)
+            enc.setBytes(&numKVVar, length: 4, index: 8)
+            enc.setBytes(&blockSizeVar, length: 4, index: 9)
+            enc.setBytes(&causalVar, length: 4, index: 10)
+            enc.setBytes(&windowStartVar, length: 4, index: 11)
+
+            let gqaRatio = numHeads / numKVHeads
+            let rowsPerHead = 32 / gqaRatio
+            let numQTiles = (seqLen + rowsPerHead - 1) / rowsPerHead
+            let threadsPerTG = MTLSize(width: 256, height: 1, depth: 1)
+            let threadgroups = MTLSize(width: numKVHeads, height: numQTiles, depth: 1)
+
+            enc.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerTG)
+            enc.endEncoding()
+            try commitAndWait(cb)
+        }
+    }
 
     // MARK: - Decode (Generate one new token per sequence)
 
@@ -894,6 +1090,19 @@ public class PagedAttentionEngine: @unchecked Sendable {
         ))
     }
 
+    private func shouldUseMMADecode(headDim: Int, dataType: PagedAttentionDataType) -> Bool {
+        return headDim == 64 && dataType == .float16
+    }
+
+    private func shouldUseFlashDecode(headDim: Int, dataType: PagedAttentionDataType) -> Bool {
+        if shouldUseMMADecode(headDim: headDim, dataType: dataType) { return false }
+        guard headDim <= 128 else { return false }
+        switch dataType {
+        case .float16, .float32: return true
+        case .float8: return false
+        }
+    }
+
     private func decodeFlat(
         q: MTLBuffer,
         kPool: MTLBuffer,
@@ -912,6 +1121,9 @@ public class PagedAttentionEngine: @unchecked Sendable {
         kScaleBuffer: MTLBuffer? = nil,
         vScaleBuffer: MTLBuffer? = nil
     ) throws {
+        let useMMA = shouldUseMMADecode(headDim: headDim, dataType: dataType)
+        let useFlashDecode = useMMA ? false : shouldUseFlashDecode(headDim: headDim, dataType: dataType)
+
         try withRetry(operation: "decodeFlat") {
             let cb = cmdBufManager.next()
             guard let enc = cb.makeComputeCommandEncoder() else {
@@ -919,10 +1131,20 @@ public class PagedAttentionEngine: @unchecked Sendable {
             }
 
             let pipeline: MTLComputePipelineState
-            switch dataType {
-            case .float8: pipeline = decodePipelineFP8
-            case .float16: pipeline = decodePipelineF16
-            case .float32: pipeline = decodePipeline
+            if useMMA {
+                pipeline = flashDecodePipelineMMA[0]
+            } else if useFlashDecode {
+                switch dataType {
+                case .float16: pipeline = flashDecodePipelineF16
+                case .float32: pipeline = flashDecodePipelineF32
+                default: pipeline = decodePipeline
+                }
+            } else {
+                switch dataType {
+                case .float8: pipeline = decodePipelineFP8
+                case .float16: pipeline = decodePipelineF16
+                case .float32: pipeline = decodePipeline
+                }
             }
             enc.setComputePipelineState(pipeline)
             enc.setBuffer(q, offset: 0, index: 0)
@@ -941,21 +1163,44 @@ public class PagedAttentionEngine: @unchecked Sendable {
             var windowSizeVar = UInt32(windowSize)
 
             enc.setBytes(&batchSizeVar, length: 4, index: 6)
-            enc.setBytes(&headDimVar, length: 4, index: 7)
-            enc.setBytes(&numHeadsVar, length: 4, index: 8)
-            enc.setBytes(&numKVVar, length: 4, index: 9)
-            enc.setBytes(&blockSizeVar, length: 4, index: 10)
-            enc.setBytes(&maxNumBlocksVar, length: 4, index: 11)
-            enc.setBytes(&windowSizeVar, length: 4, index: 12)
+            if useMMA {
+                enc.setBytes(&numHeadsVar, length: 4, index: 7)
+                enc.setBytes(&numKVVar, length: 4, index: 8)
+                enc.setBytes(&blockSizeVar, length: 4, index: 9)
+                enc.setBytes(&maxNumBlocksVar, length: 4, index: 10)
+                enc.setBytes(&windowSizeVar, length: 4, index: 11)
+            } else {
+                enc.setBytes(&headDimVar, length: 4, index: 7)
+                enc.setBytes(&numHeadsVar, length: 4, index: 8)
+                enc.setBytes(&numKVVar, length: 4, index: 9)
+                enc.setBytes(&blockSizeVar, length: 4, index: 10)
+                enc.setBytes(&maxNumBlocksVar, length: 4, index: 11)
+                enc.setBytes(&windowSizeVar, length: 4, index: 12)
+            }
 
             if dataType == .float8 {
                 enc.setBuffer(kScaleBuffer, offset: 0, index: 13)
                 enc.setBuffer(vScaleBuffer, offset: 0, index: 14)
             }
 
-            let grid = MTLSize(width: headDim, height: numHeads, depth: batchSize)
-            let tgroup = MTLSize(width: min(headDim, 32), height: 1, depth: 1)
-            enc.dispatchThreads(grid, threadsPerThreadgroup: tgroup)
+            if useMMA {
+                let maxGQA = numHeads / numKVHeads
+                let totalPS = maxGQA * 10 * MemoryLayout<Float>.stride
+                let mlSize = maxGQA * 2 * MemoryLayout<Float>.stride
+                enc.setThreadgroupMemoryLength(totalPS, index: 0)
+                enc.setThreadgroupMemoryLength(mlSize, index: 1)
+                let grid = MTLSize(width: 1, height: numKVHeads, depth: batchSize)
+                let tgroup = MTLSize(width: 256, height: 1, depth: 1)
+                enc.dispatchThreads(grid, threadsPerThreadgroup: tgroup)
+            } else if useFlashDecode {
+                let grid = MTLSize(width: headDim, height: numKVHeads, depth: batchSize)
+                let tgroup = MTLSize(width: min(headDim, 32), height: 1, depth: 1)
+                enc.dispatchThreads(grid, threadsPerThreadgroup: tgroup)
+            } else {
+                let grid = MTLSize(width: headDim, height: numHeads, depth: batchSize)
+                let tgroup = MTLSize(width: min(headDim, 32), height: 1, depth: 1)
+                enc.dispatchThreads(grid, threadsPerThreadgroup: tgroup)
+            }
             enc.endEncoding()
             try commitAndWait(cb)
         }
@@ -1231,7 +1476,14 @@ public class PagedAttentionEngine: @unchecked Sendable {
         }
     }
 
-    private func decodePipelineFor(dataType: PagedAttentionDataType) -> MTLComputePipelineState {
+    private func decodePipelineFor(dataType: PagedAttentionDataType, useFlash: Bool = false) -> MTLComputePipelineState {
+        if useFlash {
+            switch dataType {
+            case .float32: return flashDecodePipelineF32
+            case .float16: return flashDecodePipelineF16
+            case .float8: return decodePipelineFP8
+            }
+        }
         switch dataType {
         case .float32: return decodePipeline
         case .float16: return decodePipelineF16
@@ -1268,9 +1520,11 @@ public class PagedAttentionEngine: @unchecked Sendable {
             throw PagedAttentionError.invalidConfiguration("buffer/layer count mismatch")
         }
 
-        let cb = cmdBufManager.next()
+        var lastCB: MTLCommandBuffer?
 
         for i in 0..<layers.count {
+            let cb = cmdBufManager.next()
+            lastCB = cb
             guard let enc = cb.makeComputeCommandEncoder() else {
                 throw PagedAttentionError.commandEncodingFailed("failed to create encoder for layer \(i)")
             }
@@ -1284,38 +1538,66 @@ public class PagedAttentionEngine: @unchecked Sendable {
             let effectiveWindowSize = windowSize > 0 ? windowSize : layer.windowSize
             let windowStart = effectiveWindowSize > 0 ? max(0, seqLen - effectiveWindowSize) : 0
 
-            let shouldUseTiled = (blockSize * headDim * dataType.byteWidth * 3) > device.maxThreadgroupMemoryLength ||
-                (headDim * blockSize) > singlePassPipeline.maxTotalThreadsPerThreadgroup
+            let useMMA = shouldUseMMAPrefill(headDim: headDim, dataType: dataType)
+            let useFlash = !useMMA && shouldUseFlashPrefill(headDim: headDim, dataType: dataType)
 
-            let pipeline: MTLComputePipelineState
-            if shouldUseTiled {
-                pipeline = tiledPipelineFor(dataType: dataType)
-            } else {
-                pipeline = singlePassPipelineFor(dataType: dataType)
-            }
+            if useMMA {
+                let causalIdx = causal ? 1 : 0
+                let hdIdx = headDim == 128 ? 1 : 0
+                let pipeline = flashPrefillPipelineMMA[causalIdx][hdIdx]
+                enc.setComputePipelineState(pipeline)
+                enc.setBuffer(qBuffers[i], offset: 0, index: 0)
+                enc.setBuffer(kPool, offset: 0, index: 1)
+                enc.setBuffer(vPool, offset: 0, index: 2)
+                enc.setBuffer(blockTable, offset: 0, index: 3)
+                enc.setBuffer(outputBuffers[i], offset: 0, index: 4)
 
-            enc.setComputePipelineState(pipeline)
-            enc.setBuffer(qBuffers[i], offset: 0, index: 0)
-            enc.setBuffer(kPool, offset: 0, index: 1)
-            enc.setBuffer(vPool, offset: 0, index: 2)
-            enc.setBuffer(blockTable, offset: 0, index: 3)
-            enc.setBuffer(outputBuffers[i], offset: 0, index: 4)
+                var seqLenVar = UInt32(seqLen)
+                var numHeadsVar = UInt32(numHeads)
+                var numKVVar = UInt32(numKVHeads)
+                var blockSizeVar = UInt32(blockSize)
+                var windowStartVar = UInt32(effectiveWindowSize > 0 ? max(0, seqLen - effectiveWindowSize) : 0)
 
-            var seqLenVar = UInt32(seqLen)
-            var headDimVar = UInt32(headDim)
-            var numHeadsVar = UInt32(numHeads)
-            var numKVVar = UInt32(numKVHeads)
-            var blockSizeVar = UInt32(blockSize)
-            var causalVar = UInt32(causal ? 1 : 0)
+                enc.setBytes(&seqLenVar, length: 4, index: 5)
+                enc.setBytes(&numHeadsVar, length: 4, index: 6)
+                enc.setBytes(&numKVVar, length: 4, index: 7)
+                enc.setBytes(&blockSizeVar, length: 4, index: 8)
+                enc.setBytes(&windowStartVar, length: 4, index: 9)
 
-            if shouldUseTiled {
-                let maxThreadgroupMemory = device.maxThreadgroupMemoryLength
-                let maxThreads = pipeline.maxTotalThreadsPerThreadgroup
-                let maxTileFromMemory = maxThreadgroupMemory / (headDim * MemoryLayout<Float>.stride)
-                let maxTileFromThreads = maxThreads / headDim
-                let qTileSizeVal = min(maxTileFromMemory, maxTileFromThreads, 32)
-                var qTileSizeVar = UInt32(qTileSizeVal)
-                var windowStartVar = UInt32(windowStart)
+                enc.setThreadgroupMemoryLength(32 * 64 * MemoryLayout<Float16>.stride, index: 0)
+                enc.setThreadgroupMemoryLength(32 * 16 * MemoryLayout<Float16>.stride, index: 1)
+                enc.setThreadgroupMemoryLength(32 * 16 * MemoryLayout<Float>.stride, index: 2)
+                enc.setThreadgroupMemoryLength(32 * 64 * MemoryLayout<Float>.stride, index: 3)
+                enc.setThreadgroupMemoryLength(64 * MemoryLayout<Float>.stride, index: 4)
+
+                let gqaRatio = numHeads / numKVHeads
+                let rowsPerHead = 32 / gqaRatio
+                let numQTiles = (seqLen + rowsPerHead - 1) / rowsPerHead
+                let threadsPerTG = MTLSize(width: 256, height: 1, depth: 1)
+                let threadgroups = MTLSize(width: numKVHeads, height: numQTiles, depth: 1)
+                enc.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerTG)
+            } else if useFlash {
+                let pipeline: MTLComputePipelineState
+                switch dataType {
+                case .float16: pipeline = flashPrefillPipelineF16
+                case .float32: pipeline = flashPrefillPipelineF32
+                case .float8: throw PagedAttentionError.invalidConfiguration("FlashAttention does not support FP8")
+                }
+
+                enc.setComputePipelineState(pipeline)
+                enc.setBuffer(qBuffers[i], offset: 0, index: 0)
+                enc.setBuffer(kPool, offset: 0, index: 1)
+                enc.setBuffer(vPool, offset: 0, index: 2)
+                enc.setBuffer(blockTable, offset: 0, index: 3)
+                enc.setBuffer(outputBuffers[i], offset: 0, index: 4)
+
+                var seqLenVar = UInt32(seqLen)
+                var headDimVar = UInt32(headDim)
+                var numHeadsVar = UInt32(numHeads)
+                var numKVVar = UInt32(numKVHeads)
+                var blockSizeVar = UInt32(blockSize)
+                var causalVar = UInt32(causal ? 1 : 0)
+                var windowStartVar = UInt32(effectiveWindowSize > 0 ? max(0, seqLen - effectiveWindowSize) : 0)
 
                 enc.setBytes(&seqLenVar, length: 4, index: 5)
                 enc.setBytes(&headDimVar, length: 4, index: 6)
@@ -1323,59 +1605,110 @@ public class PagedAttentionEngine: @unchecked Sendable {
                 enc.setBytes(&numKVVar, length: 4, index: 8)
                 enc.setBytes(&blockSizeVar, length: 4, index: 9)
                 enc.setBytes(&causalVar, length: 4, index: 10)
-                enc.setBytes(&qTileSizeVar, length: 4, index: 11)
-                enc.setBytes(&windowStartVar, length: 4, index: 12)
+                enc.setBytes(&windowStartVar, length: 4, index: 11)
 
-                if dataType == .float8 {
-                    enc.setBuffer(nil, offset: 0, index: 13)
-                    enc.setBuffer(nil, offset: 0, index: 14)
-                }
-
-                let numQTiles = (seqLen + qTileSizeVal - 1) / qTileSizeVal
-                let threadsPerTG = MTLSize(width: headDim, height: qTileSizeVal, depth: 1)
-                let threadgroups = MTLSize(width: 1, height: numQTiles, depth: numHeads)
-                let tileMemSize = qTileSizeVal * headDim * MemoryLayout<Float>.stride
-                enc.setThreadgroupMemoryLength(tileMemSize, index: 0)
-
+                let gqaRatio = numHeads / numKVHeads
+                let rowsPerHead = 32 / gqaRatio
+                let numQTiles = (seqLen + rowsPerHead - 1) / rowsPerHead
+                let threadsPerTG = MTLSize(width: 256, height: 1, depth: 1)
+                let threadgroups = MTLSize(width: numKVHeads, height: numQTiles, depth: 1)
                 enc.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerTG)
             } else {
-                var windowStartVar = UInt32(windowStart)
+                let shouldUseTiled = (blockSize * headDim * MemoryLayout<Float>.stride * 3) > device.maxThreadgroupMemoryLength ||
+                    (headDim * blockSize) > singlePassPipeline.maxTotalThreadsPerThreadgroup
 
-                enc.setBytes(&seqLenVar, length: 4, index: 5)
-                enc.setBytes(&headDimVar, length: 4, index: 6)
-                enc.setBytes(&numHeadsVar, length: 4, index: 7)
-                enc.setBytes(&numKVVar, length: 4, index: 8)
-                enc.setBytes(&blockSizeVar, length: 4, index: 9)
-                enc.setBytes(&causalVar, length: 4, index: 10)
-
-                let mBuffer = device.makeBuffer(length: seqLen * numHeads * MemoryLayout<Float>.stride, options: .storageModePrivate)!
-                let lBuffer = device.makeBuffer(length: seqLen * numHeads * MemoryLayout<Float>.stride, options: .storageModePrivate)!
-                enc.setBuffer(mBuffer, offset: 0, index: 11)
-                enc.setBuffer(lBuffer, offset: 0, index: 12)
-                enc.setBytes(&windowStartVar, length: 4, index: 13)
-
-                if dataType == .float8 {
-                    enc.setBuffer(nil, offset: 0, index: 14)
-                    enc.setBuffer(nil, offset: 0, index: 15)
+                let pipeline: MTLComputePipelineState
+                if shouldUseTiled {
+                    pipeline = tiledPipelineFor(dataType: dataType)
+                } else {
+                    pipeline = singlePassPipelineFor(dataType: dataType)
                 }
 
-                let tileMemSize = blockSize * headDim * MemoryLayout<Float>.stride
-                enc.setThreadgroupMemoryLength(tileMemSize, index: 0)
-                enc.setThreadgroupMemoryLength(tileMemSize, index: 1)
-                enc.setThreadgroupMemoryLength(tileMemSize, index: 2)
+                enc.setComputePipelineState(pipeline)
+                enc.setBuffer(qBuffers[i], offset: 0, index: 0)
+                enc.setBuffer(kPool, offset: 0, index: 1)
+                enc.setBuffer(vPool, offset: 0, index: 2)
+                enc.setBuffer(blockTable, offset: 0, index: 3)
+                enc.setBuffer(outputBuffers[i], offset: 0, index: 4)
 
-                let numQTiles = (seqLen + blockSize - 1) / blockSize
-                let threadsPerTG = MTLSize(width: headDim, height: blockSize, depth: 1)
-                let threadgroups = MTLSize(width: 1, height: numQTiles, depth: numHeads)
+                var seqLenVar = UInt32(seqLen)
+                var headDimVar = UInt32(headDim)
+                var numHeadsVar = UInt32(numHeads)
+                var numKVVar = UInt32(numKVHeads)
+                var blockSizeVar = UInt32(blockSize)
+                var causalVar = UInt32(causal ? 1 : 0)
 
-                enc.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerTG)
+                if shouldUseTiled {
+                    let maxThreadgroupMemory = device.maxThreadgroupMemoryLength
+                    let maxThreads = pipeline.maxTotalThreadsPerThreadgroup
+                    let maxTileFromMemory = maxThreadgroupMemory / (headDim * MemoryLayout<Float>.stride)
+                    let maxTileFromThreads = maxThreads / headDim
+                    let qTileSizeVal = min(maxTileFromMemory, maxTileFromThreads, 32)
+                    var qTileSizeVar = UInt32(qTileSizeVal)
+                    var windowStartVar = UInt32(windowStart)
+
+                    enc.setBytes(&seqLenVar, length: 4, index: 5)
+                    enc.setBytes(&headDimVar, length: 4, index: 6)
+                    enc.setBytes(&numHeadsVar, length: 4, index: 7)
+                    enc.setBytes(&numKVVar, length: 4, index: 8)
+                    enc.setBytes(&blockSizeVar, length: 4, index: 9)
+                    enc.setBytes(&causalVar, length: 4, index: 10)
+                    enc.setBytes(&qTileSizeVar, length: 4, index: 11)
+                    enc.setBytes(&windowStartVar, length: 4, index: 12)
+
+                    if dataType == .float8 {
+                        enc.setBuffer(nil, offset: 0, index: 13)
+                        enc.setBuffer(nil, offset: 0, index: 14)
+                    }
+
+                    let numQTiles = (seqLen + qTileSizeVal - 1) / qTileSizeVal
+                    let threadsPerTG = MTLSize(width: headDim, height: qTileSizeVal, depth: 1)
+                    let threadgroups = MTLSize(width: 1, height: numQTiles, depth: numHeads)
+                    let tileMemSize = qTileSizeVal * headDim * MemoryLayout<Float>.stride
+                    enc.setThreadgroupMemoryLength(tileMemSize, index: 0)
+
+                    enc.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerTG)
+                } else {
+                    var windowStartVar = UInt32(windowStart)
+
+                    enc.setBytes(&seqLenVar, length: 4, index: 5)
+                    enc.setBytes(&headDimVar, length: 4, index: 6)
+                    enc.setBytes(&numHeadsVar, length: 4, index: 7)
+                    enc.setBytes(&numKVVar, length: 4, index: 8)
+                    enc.setBytes(&blockSizeVar, length: 4, index: 9)
+                    enc.setBytes(&causalVar, length: 4, index: 10)
+
+                    let mBuffer = device.makeBuffer(length: seqLen * numHeads * MemoryLayout<Float>.stride, options: .storageModePrivate)!
+                    let lBuffer = device.makeBuffer(length: seqLen * numHeads * MemoryLayout<Float>.stride, options: .storageModePrivate)!
+                    enc.setBuffer(mBuffer, offset: 0, index: 11)
+                    enc.setBuffer(lBuffer, offset: 0, index: 12)
+                    enc.setBytes(&windowStartVar, length: 4, index: 13)
+
+                    if dataType == .float8 {
+                        enc.setBuffer(nil, offset: 0, index: 14)
+                        enc.setBuffer(nil, offset: 0, index: 15)
+                    }
+
+                    let tileMemSize = blockSize * headDim * MemoryLayout<Float>.stride
+                    enc.setThreadgroupMemoryLength(tileMemSize, index: 0)
+                    enc.setThreadgroupMemoryLength(tileMemSize, index: 1)
+                    enc.setThreadgroupMemoryLength(tileMemSize, index: 2)
+
+                    let numQTiles = (seqLen + blockSize - 1) / blockSize
+                    let threadsPerTG = MTLSize(width: headDim, height: blockSize, depth: 1)
+                    let threadgroups = MTLSize(width: 1, height: numQTiles, depth: numHeads)
+
+                    enc.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerTG)
+                }
             }
 
             enc.endEncoding()
+            cb.commit()
         }
 
-        cb.commit()
-        cb.waitUntilCompleted()
+        if let last = lastCB, last.status == .error {
+            throw PagedAttentionError.commandExecutionFailed(last.error?.localizedDescription ?? "Metal error in prefillLayers")
+        }
     }
 
     /// Executes batched decode across multiple transformer layers in a single command buffer.
@@ -1407,9 +1740,11 @@ public class PagedAttentionEngine: @unchecked Sendable {
             throw PagedAttentionError.invalidConfiguration("buffer/layer count mismatch")
         }
 
-        let cb = cmdBufManager.next()
+        var lastCB: MTLCommandBuffer?
 
         for i in 0..<layers.count {
+            let cb = cmdBufManager.next()
+            lastCB = cb
             guard let enc = cb.makeComputeCommandEncoder() else {
                 throw PagedAttentionError.commandEncodingFailed("failed to create decode encoder for layer \(i)")
             }
@@ -1422,7 +1757,14 @@ public class PagedAttentionEngine: @unchecked Sendable {
             let blockSize = layer.blockSize
             let effectiveWindowSize = windowSize > 0 ? windowSize : layer.windowSize
 
-            let pipeline = decodePipelineFor(dataType: dataType)
+            let useMMA = shouldUseMMADecode(headDim: headDim, dataType: dataType)
+            let useFlashDecode = useMMA ? false : shouldUseFlashDecode(headDim: headDim, dataType: dataType)
+            let pipeline: MTLComputePipelineState
+            if useMMA {
+                pipeline = flashDecodePipelineMMA[0]
+            } else {
+                pipeline = decodePipelineFor(dataType: dataType, useFlash: useFlashDecode)
+            }
 
             enc.setComputePipelineState(pipeline)
             enc.setBuffer(qBuffers[i], offset: 0, index: 0)
@@ -1441,21 +1783,46 @@ public class PagedAttentionEngine: @unchecked Sendable {
             var windowSizeVar = UInt32(effectiveWindowSize)
 
             enc.setBytes(&batchSizeVar, length: 4, index: 6)
-            enc.setBytes(&headDimVar, length: 4, index: 7)
-            enc.setBytes(&numHeadsVar, length: 4, index: 8)
-            enc.setBytes(&numKVVar, length: 4, index: 9)
-            enc.setBytes(&blockSizeVar, length: 4, index: 10)
-            enc.setBytes(&maxNumBlocksVar, length: 4, index: 11)
-            enc.setBytes(&windowSizeVar, length: 4, index: 12)
+            if useMMA {
+                enc.setBytes(&numHeadsVar, length: 4, index: 7)
+                enc.setBytes(&numKVVar, length: 4, index: 8)
+                enc.setBytes(&blockSizeVar, length: 4, index: 9)
+                enc.setBytes(&maxNumBlocksVar, length: 4, index: 10)
+                enc.setBytes(&windowSizeVar, length: 4, index: 11)
+            } else {
+                enc.setBytes(&headDimVar, length: 4, index: 7)
+                enc.setBytes(&numHeadsVar, length: 4, index: 8)
+                enc.setBytes(&numKVVar, length: 4, index: 9)
+                enc.setBytes(&blockSizeVar, length: 4, index: 10)
+                enc.setBytes(&maxNumBlocksVar, length: 4, index: 11)
+                enc.setBytes(&windowSizeVar, length: 4, index: 12)
+            }
 
-            let grid = MTLSize(width: headDim, height: numHeads, depth: batchSize)
-            let tgroup = MTLSize(width: min(headDim, 32), height: 1, depth: 1)
-            enc.dispatchThreads(grid, threadsPerThreadgroup: tgroup)
+            if useMMA {
+                let maxGQA = numHeads / numKVHeads
+                let totalPS = maxGQA * 10 * MemoryLayout<Float>.stride
+                let mlSize = maxGQA * 2 * MemoryLayout<Float>.stride
+                enc.setThreadgroupMemoryLength(totalPS, index: 0)
+                enc.setThreadgroupMemoryLength(mlSize, index: 1)
+                let grid = MTLSize(width: 1, height: numKVHeads, depth: batchSize)
+                let tgroup = MTLSize(width: 256, height: 1, depth: 1)
+                enc.dispatchThreads(grid, threadsPerThreadgroup: tgroup)
+            } else {
+                let grid = MTLSize(
+                    width: headDim,
+                    height: useFlashDecode ? numKVHeads : numHeads,
+                    depth: batchSize
+                )
+                let tgroup = MTLSize(width: min(headDim, 32), height: 1, depth: 1)
+                enc.dispatchThreads(grid, threadsPerThreadgroup: tgroup)
+            }
             enc.endEncoding()
+            cb.commit()
         }
 
-        cb.commit()
-        cb.waitUntilCompleted()
+        if let last = lastCB, last.status == .error {
+            throw PagedAttentionError.commandExecutionFailed(last.error?.localizedDescription ?? "Metal error in decodeLayers")
+        }
     }
 
     /// Appends key/value data across multiple transformer layers in a single command buffer.
@@ -1483,9 +1850,11 @@ public class PagedAttentionEngine: @unchecked Sendable {
             throw PagedAttentionError.invalidConfiguration("buffer/layer count mismatch")
         }
 
-        let cb = cmdBufManager.next()
+        var lastCB: MTLCommandBuffer?
 
         for i in 0..<layers.count {
+            let cb = cmdBufManager.next()
+            lastCB = cb
             guard let enc = cb.makeComputeCommandEncoder() else {
                 throw PagedAttentionError.commandEncodingFailed("failed to create append encoder for layer \(i)")
             }
@@ -1520,10 +1889,12 @@ public class PagedAttentionEngine: @unchecked Sendable {
             let tgroup = MTLSize(width: min(headDim, 32), height: 1, depth: 1)
             enc.dispatchThreads(grid, threadsPerThreadgroup: tgroup)
             enc.endEncoding()
+            cb.commit()
         }
 
-        cb.commit()
-        cb.waitUntilCompleted()
+        if let last = lastCB, last.status == .error {
+            throw PagedAttentionError.commandExecutionFailed(last.error?.localizedDescription ?? "Metal error in appendLayers")
+        }
     }
 
     // MARK: - Validation

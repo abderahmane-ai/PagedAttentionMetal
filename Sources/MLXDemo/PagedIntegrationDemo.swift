@@ -6,8 +6,11 @@ import PagedAttentionMetal
 import PagedAttentionMLXSupport
 
 /// Compares standard MLX attention vs paged attention performance.
+///
+/// Both sides prefill seqLen tokens against seqLen K/V; times only the attention kernel.
+/// PagedAttention side measures `engine.prefill` (excluding cache setup).
 func runAttentionComparison(device: MTLDevice, engine: PagedAttentionEngine) {
-    print("\n=== Attention Comparison: MLX vs PagedAttention ===\n")
+    print("\n=== Attention Comparison: MLX vs PagedAttention (Prefill) ===\n")
 
     // LLaMA 3.2 1B dimensions
     let headDim = 64
@@ -23,19 +26,23 @@ func runAttentionComparison(device: MTLDevice, engine: PagedAttentionEngine) {
         dataType: .float16
     )
 
-    for seqLen in [8, 16, 32, 64] {
+    let seqLens = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+    let maxSeqLen = seqLens.max()!
+    let maxBlocks = (maxSeqLen + blockSize - 1) / blockSize + 4
+
+    for seqLen in seqLens {
         let batch = 1
-        let key = MLXRandom.key(42)
+        let seed = UInt64(seqLen)
 
         // Generate synthetic Q, K, V matching MLX's [B, nHeads, seqLen, headDim] layout
-        let q = MLXRandom.uniform(0..<1, [batch, numHeads, seqLen, headDim], key: key)
-        let k = MLXRandom.uniform(0..<1, [batch, numKVHeads, seqLen, headDim], key: key)
-        let v = MLXRandom.uniform(0..<1, [batch, numKVHeads, seqLen, headDim], key: key)
+        let q = MLXRandom.uniform(0..<1, [batch, numHeads, seqLen, headDim], key: MLXRandom.key(seed + 0))
+        let k = MLXRandom.uniform(0..<1, [batch, numKVHeads, seqLen, headDim], key: MLXRandom.key(seed + 1))
+        let v = MLXRandom.uniform(0..<1, [batch, numKVHeads, seqLen, headDim], key: MLXRandom.key(seed + 2))
         eval(q, k, v)
 
         let scale = 1.0 / sqrt(Float(headDim))
 
-        // Standard MLX attention
+        // ── Standard MLX attention ──────────────────────────────
         var totalMLX: Double = 0
         let warmup = 3
         let samples = 20
@@ -55,33 +62,84 @@ func runAttentionComparison(device: MTLDevice, engine: PagedAttentionEngine) {
         }
         let avgMLX = totalMLX / Double(samples)
 
-        // PagedAttention
+        // ── PagedAttention ───────────────────────────────────────
+        // Create cache + pre-append K/V once (outside timed section)
+        let cache = KVCacheManager(
+            device: device,
+            maxBlocks: maxBlocks * 2,
+            blockSize: blockSize,
+            headDim: headDim,
+            numKVHeads: numKVHeads,
+            dataType: .float16
+        )
+        try! cache.allocateSequence(id: 1)
+        try! cache.appendTokens(toSequence: 1, count: seqLen)
+
+        // MLX [B, nHeads, seqLen, headDim] -> Metal [seqLen, nHeads, headDim] (transposed(0,2,1,3))
+        let qMetal = q.transposed(0, 2, 1, 3)
+        let kMetal = k.transposed(0, 2, 1, 3)
+        let vMetal = v.transposed(0, 2, 1, 3)
+
+        let qBuffer = try! pagedMetalBuffer(device: device, from: qMetal)
+        let kBuffer = try! pagedMetalBuffer(device: device, from: kMetal)
+        let vBuffer = try! pagedMetalBuffer(device: device, from: vMetal)
+
+        let outputBuffer = device.makeBuffer(
+            length: seqLen * numHeads * headDim * 2,
+            options: .storageModeShared
+        )!
+
+        // Append K/V to cache (setup, not timed)
+        try! engine.appendToCache(PagedKVAppendRequest(
+            keys: kBuffer, values: vBuffer,
+            kPool: cache.kPoolBuffer, vPool: cache.vPoolBuffer,
+            blockTable: try! cache.getBlockTableBuffer(forSequence: 1),
+            tokenOffset: 0, numNewTokens: seqLen, layer: layerSpec
+        ))
+
+        let blockTable = try! cache.getBlockTableBuffer(forSequence: 1)
+
         var totalPA: Double = 0
         for i in 0..<(warmup + samples) {
-            let pagedCache = try! PagedMetalKVCache(
-                sequenceID: 1,
-                layer: layerSpec,
-                maxBlocks: 64,
-                device: device,
-                engine: engine
-            )
-
             let start = CFAbsoluteTimeGetCurrent()
-            let out = try! pagedCache.pagedAttention(queries: q, keys: k, values: v, mask: .none)
-            eval(out)
+            try! engine.prefill(
+                q: qBuffer,
+                kPool: cache.kPoolBuffer,
+                vPool: cache.vPoolBuffer,
+                blockTable: blockTable,
+                seqLen: seqLen,
+                headDim: headDim,
+                numHeads: numHeads,
+                numKVHeads: numKVHeads,
+                blockSize: blockSize,
+                causal: false,
+                output: outputBuffer,
+                dataType: .float16
+            )
             let t = (CFAbsoluteTimeGetCurrent() - start) * 1000
             if i >= warmup { totalPA += t }
         }
         let avgPA = totalPA / Double(samples)
 
         let speedup = avgMLX / avgPA
-        let label = speedup > 1.0 ? "✓" : ""
-        print("  seqLen=\(seqLen)  MLX: \(String(format: "%.3f", avgMLX)) ms  Paged: \(String(format: "%.3f", avgPA)) ms  \(String(format: "%.1f", speedup))x \(label)")
+        let winner = speedup > 1.0 ? "Paged" : "MLX"
+        let ratio = speedup > 1.0 ? speedup : (1.0 / speedup)
+        let faster = speedup > 1.0
+        print("  seqLen=\(String(format: "%4d", seqLen))  MLX: \(String(format: "%7.3f", avgMLX)) ms  Paged: \(String(format: "%7.3f", avgPA)) ms  \(winner) \(String(format: "%.1f", ratio))x\(faster ? "  ✓" : "")")
+
+        cache.freeSequence(id: 1)
     }
 
     print()
-    // Interpret results
-    print("Results: PagedAttention runs on GPU (Metal) while MLX runs on CPU/GPU.")
-    print("For prefill (seqLen ≥ 32), Metal kernel launch cost is amortized.")
-    print("For decode (seqLen = 1), MLX's CPU path is faster due to overhead.\n")
+    print("Both sides measure ONLY the attention kernel (no cache setup overhead).")
+    print("Crossover point = seqLen where PagedAttention matches or beats MLX.")
+    print("At longer contexts, Paged's tiled kernel avoids O(n²) memory.\n")
+}
+
+/// Creates a Metal buffer from an MLX array by copying the raw bytes.
+func pagedMetalBuffer(device: MTLDevice, from array: MLXArray) throws -> MTLBuffer {
+    guard let buffer = array.asMTLBuffer(device: device, noCopy: false) else {
+        throw PagedAttentionMLXError.bufferCreationFailed("array")
+    }
+    return buffer
 }

@@ -155,7 +155,8 @@ struct PrecisionBenchmark {
         let headDim = 128
         let blockSize = 16
         let qSize = seqLen * 8 * headDim
-        let kvSize = seqLen * headDim
+        let maxKVHeads = 2
+        let kvSize = seqLen * maxKVHeads * headDim
 
         let q = (0..<qSize).map { _ in Float.random(in: -1...1) }
         let k = (0..<kvSize).map { _ in Float.random(in: -1...1) }

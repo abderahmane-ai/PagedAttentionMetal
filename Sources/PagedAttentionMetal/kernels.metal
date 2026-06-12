@@ -1,7 +1,531 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// MARK: - Atomic Add Helper (for float)
+// MARK: - FlashAttention Prefill (GQA-aware, Direct Device Reads)
+
+// Grid: (num_kv_heads, (seq_len + 31) / 32, 1)
+// TG: 256 threads = 8 simdgroups × 32 threads
+//   Each simdgroup: 4 Q-rows per Q-head in the GQA group
+//   Each thread: 8 D-elements
+// Total Q-rows per TG: 32, distributed across gqa_ratio heads
+// GQA: one TG handles all Q-heads sharing one KV-head → KV reads × GQA-ratio
+// No threadgroup memory — direct device reads bypass 23 GB/s tgmem bottleneck
+
+static void fa_load8_half(device const half* base, uint off, thread float* v) {
+    half4 v0 = *(device const half4*)(base + off);
+    half4 v1 = *(device const half4*)(base + off + 4);
+    v[0] = float(v0[0]); v[1] = float(v0[1]);
+    v[2] = float(v0[2]); v[3] = float(v0[3]);
+    v[4] = float(v1[0]); v[5] = float(v1[1]);
+    v[6] = float(v1[2]); v[7] = float(v1[3]);
+}
+
+kernel void flash_attention_prefill_f16(
+    device const half  *Q            [[buffer(0)]],
+    device const half  *K_pool       [[buffer(1)]],
+    device const half  *V_pool       [[buffer(2)]],
+    device const int   *block_table  [[buffer(3)]],
+    device       half  *O            [[buffer(4)]],
+    constant uint      &seq_len      [[buffer(5)]],
+    constant uint      &head_dim     [[buffer(6)]],
+    constant uint      &num_heads    [[buffer(7)]],
+    constant uint      &num_kv_heads [[buffer(8)]],
+    constant uint      &block_size   [[buffer(9)]],
+    constant uint      &causal       [[buffer(10)]],
+    constant uint      &window_start [[buffer(11)]],
+    uint3  gid            [[threadgroup_position_in_grid]],
+    uint3  lid            [[thread_position_in_threadgroup]]
+) {
+    const uint kv_head_idx = gid.x;
+    const uint q_tile_idx = gid.y;
+    const uint gqa_ratio = num_heads / num_kv_heads;
+    const uint sg_per_head = 8u / gqa_ratio;
+
+    const uint tid = lid.x;
+    const uint sg_id = tid / 32u;
+    const uint lane = tid % 32u;
+    const uint row_in_sg = lane / 8u;
+    const uint d_group = lane % 8u;
+
+    const uint head_within_group = sg_id / sg_per_head;
+    const uint sg_within_head = sg_id % sg_per_head;
+    const uint row_within_head = sg_within_head * 4u + row_in_sg;
+    const uint head_idx = kv_head_idx * gqa_ratio + head_within_group;
+
+    const uint rows_per_head = 32u / gqa_ratio;
+    const uint q_start = q_tile_idx * rows_per_head;
+    const uint q_row = q_start + row_within_head;
+    const uint d_start = d_group * 8u;
+
+    if (q_row >= seq_len || d_start + 7u >= head_dim) return;
+
+    const float scale = 1.0f / sqrt(float(head_dim));
+    device const half* q_base = Q + (q_row * num_heads + head_idx) * head_dim;
+    float qv[8];
+    fa_load8_half(q_base, d_start, qv);
+
+    float m_i = -INFINITY;
+    float l_i = 0.0f;
+    float ov[8] = {0.0f};
+
+    const uint k_end = causal ? min(q_row + 1u, seq_len) : seq_len;
+
+    for (uint k_block = window_start; k_block < k_end; k_block += block_size) {
+        int physical_block = block_table[k_block / block_size];
+        device const half* K_block = K_pool + physical_block * block_size * num_kv_heads * head_dim;
+        device const half* V_block = V_pool + physical_block * block_size * num_kv_heads * head_dim;
+
+        uint blk_end = min(k_block + block_size, k_end);
+        if (blk_end <= window_start) continue;
+
+        for (uint local_k = 0u; local_k < blk_end - k_block; local_k++) {
+            device const half* k_base = K_block + local_k * num_kv_heads * head_dim
+                                        + kv_head_idx * head_dim;
+            float kv[8];
+            fa_load8_half(k_base, d_start, kv);
+
+            float partial = 0.0f;
+            for (uint dd = 0u; dd < 8u; dd++) partial += qv[dd] * kv[dd];
+
+            float dot = partial;
+            dot += simd_shuffle_xor(dot, 1);
+            dot += simd_shuffle_xor(dot, 2);
+            dot += simd_shuffle_xor(dot, 4);
+            dot *= scale;
+
+            float m_old = m_i;
+            m_i = max(m_i, dot);
+            float corr = exp(m_old - m_i);
+            float exp_dot = exp(dot - m_i);
+            l_i = l_i * corr + exp_dot;
+
+            device const half* v_base = V_block + local_k * num_kv_heads * head_dim
+                                        + kv_head_idx * head_dim;
+            for (uint dd = 0u; dd < 8u; dd++) {
+                ov[dd] = ov[dd] * corr + exp_dot * float(v_base[d_start + dd]);
+            }
+        }
+    }
+
+    device half* o_base = O + (q_row * num_heads + head_idx) * head_dim;
+    for (uint dd = 0u; dd < 8u; dd++) o_base[d_start + dd] = half(ov[dd] / l_i);
+}
+
+
+kernel void flash_attention_prefill_f32(
+    device const float *Q            [[buffer(0)]],
+    device const float *K_pool       [[buffer(1)]],
+    device const float *V_pool       [[buffer(2)]],
+    device const int   *block_table  [[buffer(3)]],
+    device       float *O            [[buffer(4)]],
+    constant uint      &seq_len      [[buffer(5)]],
+    constant uint      &head_dim     [[buffer(6)]],
+    constant uint      &num_heads    [[buffer(7)]],
+    constant uint      &num_kv_heads [[buffer(8)]],
+    constant uint      &block_size   [[buffer(9)]],
+    constant uint      &causal       [[buffer(10)]],
+    constant uint      &window_start [[buffer(11)]],
+    uint3  gid            [[threadgroup_position_in_grid]],
+    uint3  lid            [[thread_position_in_threadgroup]]
+) {
+    const uint kv_head_idx = gid.x;
+    const uint q_tile_idx = gid.y;
+    const uint gqa_ratio = num_heads / num_kv_heads;
+    const uint sg_per_head = 8u / gqa_ratio;
+
+    const uint tid = lid.x;
+    const uint sg_id = tid / 32u;
+    const uint lane = tid % 32u;
+    const uint row_in_sg = lane / 8u;
+    const uint d_group = lane % 8u;
+
+    const uint head_within_group = sg_id / sg_per_head;
+    const uint sg_within_head = sg_id % sg_per_head;
+    const uint row_within_head = sg_within_head * 4u + row_in_sg;
+    const uint head_idx = kv_head_idx * gqa_ratio + head_within_group;
+
+    const uint rows_per_head = 32u / gqa_ratio;
+    const uint q_start = q_tile_idx * rows_per_head;
+    const uint q_row = q_start + row_within_head;
+    const uint d_start = d_group * 8u;
+
+    if (q_row >= seq_len || d_start + 7u >= head_dim) return;
+
+    const float scale = 1.0f / sqrt(float(head_dim));
+    device const float* q_base = Q + (q_row * num_heads + head_idx) * head_dim;
+    float qv[8];
+    for (uint dd = 0u; dd < 8u; dd++) qv[dd] = q_base[d_start + dd];
+
+    float m_i = -INFINITY;
+    float l_i = 0.0f;
+    float ov[8] = {0.0f};
+
+    const uint k_end = causal ? min(q_row + 1u, seq_len) : seq_len;
+
+    for (uint k_block = window_start; k_block < k_end; k_block += block_size) {
+        int physical_block = block_table[k_block / block_size];
+        device const float* K_block = K_pool + physical_block * block_size * num_kv_heads * head_dim;
+        device const float* V_block = V_pool + physical_block * block_size * num_kv_heads * head_dim;
+
+        uint blk_end = min(k_block + block_size, k_end);
+        if (blk_end <= window_start) continue;
+
+        for (uint local_k = 0u; local_k < blk_end - k_block; local_k++) {
+            device const float* k_base = K_block + local_k * num_kv_heads * head_dim
+                                         + kv_head_idx * head_dim;
+            float partial = 0.0f;
+            for (uint dd = 0u; dd < 8u; dd += 4u) {
+                float4 qw(qv[dd], qv[dd+1], qv[dd+2], qv[dd+3]);
+                float4 kw(k_base[d_start + dd], k_base[d_start + dd + 1],
+                          k_base[d_start + dd + 2], k_base[d_start + dd + 3]);
+                partial += dot(qw, kw);
+            }
+
+            float dot = partial;
+            dot += simd_shuffle_xor(dot, 1);
+            dot += simd_shuffle_xor(dot, 2);
+            dot += simd_shuffle_xor(dot, 4);
+            dot *= scale;
+
+            float m_old = m_i;
+            m_i = max(m_i, dot);
+            float corr = exp(m_old - m_i);
+            float exp_dot = exp(dot - m_i);
+            l_i = l_i * corr + exp_dot;
+
+            device const float* v_base = V_block + local_k * num_kv_heads * head_dim
+                                         + kv_head_idx * head_dim;
+            for (uint dd = 0u; dd < 8u; dd++) {
+                ov[dd] = ov[dd] * corr + exp_dot * v_base[d_start + dd];
+            }
+        }
+    }
+
+    device float* o_base = O + (q_row * num_heads + head_idx) * head_dim;
+    for (uint dd = 0u; dd < 8u; dd++) o_base[d_start + dd] = ov[dd] / l_i;
+}
+
+constant uint causal [[function_constant(0)]];
+constant uint head_dim [[function_constant(1)]];
+
+kernel void flash_attention_mma_f16(
+    device const half  *Q            [[buffer(0)]],
+    device const half  *K_pool       [[buffer(1)]],
+    device const half  *V_pool       [[buffer(2)]],
+    device const int   *block_table  [[buffer(3)]],
+    device       half  *O            [[buffer(4)]],
+    constant uint      &seq_len      [[buffer(5)]],
+    constant uint      &num_heads    [[buffer(6)]],
+    constant uint      &num_kv_heads [[buffer(7)]],
+    constant uint      &block_size   [[buffer(8)]],
+    constant uint      &window_start [[buffer(9)]],
+    uint3  gid            [[threadgroup_position_in_grid]],
+    uint3  lid            [[thread_position_in_threadgroup]],
+
+    threadgroup half  *Q_tile_ptr  [[threadgroup(0)]],
+    threadgroup half  *P_tile_ptr  [[threadgroup(1)]],
+    threadgroup float *S_tile_ptr  [[threadgroup(2)]],
+    threadgroup float *O_tile_ptr  [[threadgroup(3)]],
+    threadgroup float *ml_i_ptr    [[threadgroup(4)]]
+) {
+    constexpr uint BQ = 32;
+    constexpr uint BK = 16;
+    constexpr uint WN = 2;
+
+    const uint kv_head_idx = gid.x;
+    const uint q_tile_idx = gid.y;
+    const uint gqa_ratio = num_heads / num_kv_heads;
+    const uint rows_per_head = BQ / gqa_ratio;
+    const uint q_start = q_tile_idx * BQ;
+
+    const uint tid = lid.x;
+    const uint sg_id = tid / 32;
+    const uint sg_row = sg_id / WN;
+    const uint sg_col = sg_id % WN;
+
+    threadgroup float* m_i = ml_i_ptr;
+    threadgroup float* l_i = ml_i_ptr + BQ;
+
+    {
+        const uint q_row = tid / 8;
+        const uint chunk = tid % 8;
+        if (q_row < BQ) {
+            const uint head_within = q_row / rows_per_head;
+            const uint head_idx = kv_head_idx * gqa_ratio + head_within;
+            const bool valid = (head_within < gqa_ratio) && (q_start + q_row < seq_len);
+            device const half* qb = Q + ((q_start + q_row) * num_heads + head_idx) * head_dim;
+            for (uint d = chunk * 8; d < head_dim; d += 64) {
+                if (valid) {
+                    for (uint i = 0; i < 8; i++)
+                        Q_tile_ptr[q_row * head_dim + d + i] = qb[d + i];
+                } else {
+                    for (uint i = 0; i < 8; i++)
+                        Q_tile_ptr[q_row * head_dim + d + i] = 0.0h;
+                }
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < BQ) { m_i[tid] = -INFINITY; l_i[tid] = 0.0f; }
+    for (uint o = tid; o < BQ * head_dim; o += 256) O_tile_ptr[o] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float scale = 1.0f / sqrt(float(head_dim));
+    const uint k_limit = causal ? min(q_start + BQ, seq_len) : seq_len;
+
+    for (uint k_block = window_start; k_block < k_limit; k_block += BK) {
+        int pb = block_table[k_block / BK];
+        device const half* Kb = K_pool + pb * BK * num_kv_heads * head_dim;
+        device const half* Vb = V_pool + pb * BK * num_kv_heads * head_dim;
+
+        {
+            const uint qrow_in_sg = (tid % 32) / 8;
+            const uint d_chunk = (tid % 32) % 8;
+            const uint q_row = sg_id * 4 + qrow_in_sg;
+            for (uint kt = 0; kt < BK; kt++) {
+                float full = 0.0f;
+                for (uint d_block = 0; d_block < head_dim; d_block += 64) {
+                    uint d_start = d_block + d_chunk * 8;
+                    float partial = 0.0f;
+                    for (uint i = 0; i < 8; i++)
+                        partial += float(Q_tile_ptr[q_row * head_dim + d_start + i])
+                                 * float(Kb[kt * num_kv_heads * head_dim + kv_head_idx * head_dim + d_start + i]);
+                    full += partial;
+                }
+                float red = full;
+                red += simd_shuffle_xor(red, 1);
+                red += simd_shuffle_xor(red, 2);
+                red += simd_shuffle_xor(red, 4);
+                if (d_chunk == 0)
+                    S_tile_ptr[q_row * BK + kt] = red;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint s = tid; s < BQ * BK; s += 256) S_tile_ptr[s] *= scale;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        {
+            uint row = tid / 8;
+            uint lir = tid % 8;
+            uint es = lir * 2;
+
+            if (row < BQ) {
+                float m_old = m_i[row];
+                float l_old = l_i[row];
+                float S[2];
+                for (uint i = 0; i < 2; i++) {
+                    uint j = es + i;
+                    float sv = S_tile_ptr[row * BK + j];
+                    if (causal && k_block + j > q_start + row) sv = -INFINITY;
+                    S[i] = sv;
+                }
+
+                float pm = max(S[0], S[1]);
+                pm = max(pm, simd_shuffle_xor(pm, 1));
+                pm = max(pm, simd_shuffle_xor(pm, 2));
+                pm = max(pm, simd_shuffle_xor(pm, 4));
+                float m_new = max(m_old, pm);
+                float alpha = exp(m_old - m_new);
+
+                float ps = 0.0f;
+                for (uint i = 0; i < 2; i++) {
+                    float pv = exp(S[i] - m_new);
+                    S[i] = pv;
+                    ps += pv;
+                }
+                ps = ps + simd_shuffle_xor(ps, 1);
+                ps = ps + simd_shuffle_xor(ps, 2);
+                ps = ps + simd_shuffle_xor(ps, 4);
+                float l_new = l_old * alpha + ps;
+
+                if (lir == 0) { m_i[row] = m_new; l_i[row] = l_new; }
+
+                for (uint d = lir * 8; d < head_dim; d += 64)
+                    for (uint i = 0; i < 8; i++)
+                        O_tile_ptr[row * head_dim + d + i] *= alpha;
+
+                for (uint i = 0; i < 2; i++)
+                    P_tile_ptr[row * BK + es + i] = half(S[i]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        {
+            uint qr = sg_row * 8;
+            for (uint dp = 0; dp < head_dim / (WN * 8); dp++) {
+                uint d_base = dp * WN * 8;
+                uint d_off = d_base + sg_col * 8;
+
+                simdgroup_float8x8 O_local(0.0f);
+                simdgroup_load(O_local, O_tile_ptr, head_dim, ulong2(d_off, qr));
+
+                for (uint k = 0; k < BK; k += 8) {
+                    simdgroup_half8x8 Pm, Vm;
+                    simdgroup_load(Pm, P_tile_ptr, BK, ulong2(k, qr));
+                    simdgroup_load(Vm, Vb, num_kv_heads * head_dim,
+                        ulong2(kv_head_idx * head_dim + d_off, k));
+                    simdgroup_multiply_accumulate(O_local, Pm, Vm, O_local);
+                }
+
+                simdgroup_store(O_local, O_tile_ptr, head_dim, ulong2(d_off, qr));
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    {
+        const uint num_elems = BQ * head_dim;
+        for (uint e = tid * 8; e < num_elems; e += 2048) {
+            for (uint i = 0; i < 8; i++) {
+                uint idx = e + i;
+                if (idx < num_elems) {
+                    uint r = idx / head_dim;
+                    uint c = idx % head_dim;
+                    uint gqr = q_start + r;
+                    if (gqr < seq_len) {
+                        uint hwg = r / rows_per_head;
+                        uint hi = kv_head_idx * gqa_ratio + hwg;
+                        if (hwg < gqa_ratio) {
+                            device half* ob = O + (gqr * num_heads + hi) * head_dim;
+                            ob[c] = half(O_tile_ptr[idx] / l_i[r]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Performs decode (single query, multi-token attention) with simdgroup_matrix for
+// Q·K dot products and P·V accumulation.
+kernel void flash_decode_mma_f16(
+    device const half  *Q                [[buffer(0)]],
+    device const half  *K_pool           [[buffer(1)]],
+    device const half  *V_pool           [[buffer(2)]],
+    device const int   *block_tables     [[buffer(3)]],
+    device const uint  *seq_lengths      [[buffer(4)]],
+    device half        *O                [[buffer(5)]],
+    constant uint      &batch_size       [[buffer(6)]],
+    constant uint      &num_heads        [[buffer(7)]],
+    constant uint      &num_kv_heads     [[buffer(8)]],
+    constant uint      &block_size       [[buffer(9)]],
+    constant uint      &max_num_blocks   [[buffer(10)]],
+    constant uint      &window_size      [[buffer(11)]],
+    uint3 gid [[threadgroup_position_in_grid]],
+    uint3 lid [[thread_position_in_threadgroup]],
+
+    threadgroup float *partial_scores [[threadgroup(0)]],
+    threadgroup float *m_l_ptr        [[threadgroup(1)]]
+) {
+    constexpr uint BD = 64;
+    if (head_dim != BD) return;
+
+    const uint kv_head_idx = gid.y;
+    const uint batch_idx = gid.z;
+    const uint gqa_ratio = num_heads / num_kv_heads;
+    const uint tid = lid.x;
+    const uint sg_id = tid / 32;
+    const uint lane = tid % 32;
+    const uint d_chunk = sg_id * 8;
+
+    if (d_chunk >= BD) return;
+
+    const uint seq_len = seq_lengths[batch_idx];
+    const float scale = 1.0f / sqrt(float(BD));
+    const uint ws = (window_size > 0 && seq_len > window_size) ? seq_len - window_size : 0;
+
+    device const int* bt = block_tables + batch_idx * max_num_blocks;
+    uint nb = (seq_len + block_size - 1u) / block_size;
+    if (nb > max_num_blocks) nb = max_num_blocks;
+    uint sb = ws / block_size;
+
+    threadgroup float* m_i = m_l_ptr;
+    threadgroup float* l_i = m_l_ptr + gqa_ratio;
+    threadgroup float* ps = partial_scores;
+
+    if (tid < gqa_ratio) { m_i[tid] = -INFINITY; l_i[tid] = 0.0f; }
+    device half* O_head = O + (batch_idx * num_heads + kv_head_idx * gqa_ratio) * BD;
+    for (uint o = tid; o < gqa_ratio * BD; o += 256) O_head[o] = 0.0h;
+    for (uint p = tid; p < gqa_ratio * 8 + gqa_ratio * 2; p += 256) ps[p] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint lb = sb; lb < nb; lb++) {
+        int pb = bt[lb];
+        device const half* Kb = K_pool + pb * block_size * num_kv_heads * BD + kv_head_idx * BD;
+        device const half* Vb = V_pool + pb * block_size * num_kv_heads * BD + kv_head_idx * BD;
+
+        uint bs = lb * block_size;
+        uint be = min(bs + block_size, seq_len);
+
+        for (uint j = bs; j < be; j++) {
+            if (j < ws) continue;
+            uint lj = j - bs;
+            device const half* K_tok = Kb + lj * num_kv_heads * BD;
+            device const half* V_tok = Vb + lj * num_kv_heads * BD;
+
+            // Phase 1: Cooperative Q·K dot product
+            // 32 threads per simdgroup, 4 per head × 2 D-values = 8 D per head
+            uint head = lane / 4;
+            uint d0 = 2 * (lane % 4);
+            uint d1 = d0 + 1;
+            float partial = 0.0f;
+            if (head < gqa_ratio && d1 < 8) {
+                uint q_base = (batch_idx * num_heads + kv_head_idx * gqa_ratio + head) * BD;
+                float qv0 = float(Q[q_base + d_chunk + d0]);
+                float qv1 = float(Q[q_base + d_chunk + d1]);
+                float kv0 = float(K_tok[d_chunk + d0]);
+                float kv1 = float(K_tok[d_chunk + d1]);
+                partial = qv0 * kv0 + qv1 * kv1;
+            }
+            partial += simd_shuffle_xor(partial, 1);
+            partial += simd_shuffle_xor(partial, 2);
+            float part_sum = partial;
+            if (head < gqa_ratio) {
+                ps[head * 8 + sg_id] = part_sum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Phase 2: Cross-simdgroup reduction + online softmax
+            if (tid < gqa_ratio) {
+                float score = 0.0f;
+                for (uint s = 0; s < 8; s++) score += ps[tid * 8 + s];
+                score *= scale;
+                float m_old = m_i[tid];
+                float m_new = max(m_old, score);
+                float alpha = exp(m_old - m_new);
+                float p = exp(score - m_new);
+                float l_new = l_i[tid] * alpha + p;
+                m_i[tid] = m_new;
+                l_i[tid] = l_new;
+                ps[gqa_ratio * 8 + tid] = alpha;
+                ps[gqa_ratio * 8 + gqa_ratio + tid] = p;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Phase 3: P·V accumulation (all threads)
+            uint ne = gqa_ratio * BD;
+            for (uint e = tid; e < ne; e += 256) {
+                uint h = e / BD;
+                uint d = e % BD;
+                float v_val = float(V_tok[d]);
+                float alphav = ps[gqa_ratio * 8 + h];
+                float prob = ps[gqa_ratio * 8 + gqa_ratio + h];
+                O_head[h * BD + d] = half(float(O_head[h * BD + d]) * alphav + prob * v_val);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    // Final normalization: divide O by l_i
+    uint total_elements = gqa_ratio * BD;
+    for (uint o = tid; o < total_elements; o += 256) {
+        uint h = o / BD;
+        uint d = o % BD;
+        O_head[o] = half(float(O_head[o]) / l_i[h]);
+    }
+}
 
 #if __METAL_VERSION__ >= 300
 void atomic_add_float(device float* ptr, float value) {
@@ -268,8 +792,9 @@ kernel void paged_attention_tiled(
             float m_old = m_i;
             m_i = max(m_i, dot);
             float correction = exp(m_old - m_i);
-            l_i = l_i * correction + exp(dot - m_i);
-            acc_o = acc_o * correction + exp(dot - m_i) * V_token[col];
+            float exp_dot = exp(dot - m_i);
+            l_i = l_i * correction + exp_dot;
+            acc_o = acc_o * correction + exp_dot * V_token[col];
         }
     }
 
@@ -342,8 +867,9 @@ kernel void paged_attention_tiled_f16(
             float m_old = m_i;
             m_i = max(m_i, dot);
             float correction = exp(m_old - m_i);
-            l_i = l_i * correction + exp(dot - m_i);
-            acc_o = acc_o * correction + exp(dot - m_i) * float(V_token[col]);
+            float exp_dot = exp(dot - m_i);
+            l_i = l_i * correction + exp_dot;
+            acc_o = acc_o * correction + exp_dot * float(V_token[col]);
         }
     }
 
@@ -420,8 +946,9 @@ kernel void paged_attention_tiled_fp8(
             float m_old = m_i;
             m_i = max(m_i, dot);
             float correction = exp(m_old - m_i);
-            l_i = l_i * correction + exp(dot - m_i);
-            acc_o = acc_o * correction + exp(dot - m_i) * float(dequant_fp8(V_token[col], v_scale));
+            float exp_dot = exp(dot - m_i);
+            l_i = l_i * correction + exp_dot;
+            acc_o = acc_o * correction + exp_dot * float(dequant_fp8(V_token[col], v_scale));
         }
     }
 
@@ -516,9 +1043,10 @@ kernel void paged_attention_single(
                 float m_old = m_i;
                 m_i = max(m_i, dot);
                 float correction = exp(m_old - m_i);
-                l_i = l_i * correction + exp(dot - m_i);
+                float exp_dot = exp(dot - m_i);
+                l_i = l_i * correction + exp_dot;
                 acc_o = acc_o * correction;
-                acc_o += exp(dot - m_i) * V_tile[local_j * head_dim + col];
+                acc_o += exp_dot * V_tile[local_j * head_dim + col];
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -614,9 +1142,10 @@ kernel void paged_attention_single_f16(
                 float m_old = m_i;
                 m_i = max(m_i, dot);
                 float correction = exp(m_old - m_i);
-                l_i = l_i * correction + exp(dot - m_i);
+                float exp_dot = exp(dot - m_i);
+                l_i = l_i * correction + exp_dot;
                 acc_o = acc_o * correction;
-                acc_o += exp(dot - m_i) * V_tile[local_j * head_dim + col];
+                acc_o += exp_dot * V_tile[local_j * head_dim + col];
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -716,9 +1245,10 @@ kernel void paged_attention_single_fp8(
                 float m_old = m_i;
                 m_i = max(m_i, dot);
                 float correction = exp(m_old - m_i);
-                l_i = l_i * correction + exp(dot - m_i);
+                float exp_dot = exp(dot - m_i);
+                l_i = l_i * correction + exp_dot;
                 acc_o = acc_o * correction;
-                acc_o += exp(dot - m_i) * V_tile[local_j * head_dim + col];
+                acc_o += exp_dot * V_tile[local_j * head_dim + col];
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1001,8 +1531,9 @@ kernel void paged_decode_single(
             float m_old = m_i;
             m_i = max(m_i, dot);
             float correction = exp(m_old - m_i);
-            l_i = l_i * correction + exp(dot - m_i);
-            acc_o = acc_o * correction + exp(dot - m_i) * V_token[d];
+            float exp_dot = exp(dot - m_i);
+            l_i = l_i * correction + exp_dot;
+            acc_o = acc_o * correction + exp_dot * V_token[d];
         }
     }
 
@@ -1068,8 +1599,9 @@ kernel void paged_decode_single_f16(
             float m_old = m_i;
             m_i = max(m_i, dot);
             float correction = exp(m_old - m_i);
-            l_i = l_i * correction + exp(dot - m_i);
-            acc_o = acc_o * correction + exp(dot - m_i) * float(V_token[d]);
+            float exp_dot = exp(dot - m_i);
+            l_i = l_i * correction + exp_dot;
+            acc_o = acc_o * correction + exp_dot * float(V_token[d]);
         }
     }
 
@@ -1139,12 +1671,199 @@ kernel void paged_decode_single_fp8(
             float m_old = m_i;
             m_i = max(m_i, dot);
             float correction = exp(m_old - m_i);
-            l_i = l_i * correction + exp(dot - m_i);
-            acc_o = acc_o * correction + exp(dot - m_i) * float(dequant_fp8(V_token[d], v_scale));
+            float exp_dot = exp(dot - m_i);
+            l_i = l_i * correction + exp_dot;
+            acc_o = acc_o * correction + exp_dot * float(dequant_fp8(V_token[d], v_scale));
         }
     }
 
     O[(batch_idx * num_heads + head_idx) * head_dim + d] = half(acc_o / l_i);
+}
+
+
+// MARK: - FlashAttention Decode (GQA-aware, Direct Device Reads, Cooperative Dot)
+
+kernel void flash_decode_f16(
+    device const half  *Q                [[buffer(0)]],
+    device const half  *K_pool           [[buffer(1)]],
+    device const half  *V_pool           [[buffer(2)]],
+    device const int   *block_tables     [[buffer(3)]],
+    device const uint  *seq_lengths      [[buffer(4)]],
+    device half        *O                [[buffer(5)]],
+    constant uint      &batch_size       [[buffer(6)]],
+    constant uint      &head_dim         [[buffer(7)]],
+    constant uint      &num_heads        [[buffer(8)]],
+    constant uint      &num_kv_heads     [[buffer(9)]],
+    constant uint      &block_size       [[buffer(10)]],
+    constant uint      &max_num_blocks   [[buffer(11)]],
+    constant uint      &window_size      [[buffer(12)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    const uint d           = gid.x;
+    const uint kv_head_idx = gid.y;
+    const uint batch_idx   = gid.z;
+    const uint gqa_ratio   = num_heads / num_kv_heads;
+    const uint lane        = d;
+
+    if (d >= head_dim || kv_head_idx >= num_kv_heads || batch_idx >= batch_size) return;
+
+    const uint seq_len = seq_lengths[batch_idx];
+    const float scale = 1.0f / sqrt(float(head_dim));
+    const uint window_start = (window_size > 0 && seq_len > window_size) ? seq_len - window_size : 0;
+
+    device const int* block_table = block_tables + batch_idx * max_num_blocks;
+
+    uint num_logical_blocks = (seq_len + block_size - 1u) / block_size;
+    if (num_logical_blocks > max_num_blocks) num_logical_blocks = max_num_blocks;
+    uint start_logical_block = window_start / block_size;
+
+    float m_i_arr[8];
+    float l_i_arr[8];
+    float acc_o_arr[8];
+    for (uint h = 0u; h < gqa_ratio; h++) {
+        m_i_arr[h] = -INFINITY;
+        l_i_arr[h] = 0.0f;
+        acc_o_arr[h] = 0.0f;
+    }
+
+    for (uint logical_block = start_logical_block; logical_block < num_logical_blocks; logical_block++) {
+        int physical_block = block_table[logical_block];
+        device const half* K_block = K_pool + physical_block * block_size * num_kv_heads * head_dim;
+        device const half* V_block = V_pool + physical_block * block_size * num_kv_heads * head_dim;
+
+        uint block_start = logical_block * block_size;
+        uint block_end = min(block_start + block_size, seq_len);
+
+        for (uint j = block_start; j < block_end; j++) {
+            if (j < window_start) continue;
+            uint local_j = j - block_start;
+            device const half* K_token = K_block + local_j * num_kv_heads * head_dim + kv_head_idx * head_dim;
+            device const half* V_token = V_block + local_j * num_kv_heads * head_dim + kv_head_idx * head_dim;
+
+            float k_val = float(K_token[d]);
+            float v_val = float(V_token[d]);
+
+            for (uint h = 0u; h < gqa_ratio; h++) {
+                const uint head_idx = kv_head_idx * gqa_ratio + h;
+                device const half* q_vec = Q + (batch_idx * num_heads + head_idx) * head_dim;
+
+                float partial = float(q_vec[d]) * k_val;
+                for (uint stride = 32u; stride < head_dim; stride += 32u) {
+                    partial += float(q_vec[d + stride]) * float(K_token[d + stride]);
+                }
+                partial += simd_shuffle_xor(partial, 1);
+                partial += simd_shuffle_xor(partial, 2);
+                partial += simd_shuffle_xor(partial, 4);
+                partial += simd_shuffle_xor(partial, 8);
+                partial += simd_shuffle_xor(partial, 16);
+                float dot = partial * scale;
+
+                float m_old = m_i_arr[h];
+                m_i_arr[h] = max(m_old, dot);
+                float corr = exp(m_old - m_i_arr[h]);
+                float exp_dot = exp(dot - m_i_arr[h]);
+                l_i_arr[h] = l_i_arr[h] * corr + exp_dot;
+                acc_o_arr[h] = acc_o_arr[h] * corr + exp_dot * v_val;
+            }
+        }
+    }
+
+    for (uint h = 0u; h < gqa_ratio; h++) {
+        const uint head_idx = kv_head_idx * gqa_ratio + h;
+        O[(batch_idx * num_heads + head_idx) * head_dim + d] = half(acc_o_arr[h] / l_i_arr[h]);
+    }
+}
+
+
+kernel void flash_decode_f32(
+    device const float *Q                [[buffer(0)]],
+    device const float *K_pool           [[buffer(1)]],
+    device const float *V_pool           [[buffer(2)]],
+    device const int   *block_tables     [[buffer(3)]],
+    device const uint  *seq_lengths      [[buffer(4)]],
+    device float       *O                [[buffer(5)]],
+    constant uint      &batch_size       [[buffer(6)]],
+    constant uint      &head_dim         [[buffer(7)]],
+    constant uint      &num_heads        [[buffer(8)]],
+    constant uint      &num_kv_heads     [[buffer(9)]],
+    constant uint      &block_size       [[buffer(10)]],
+    constant uint      &max_num_blocks   [[buffer(11)]],
+    constant uint      &window_size      [[buffer(12)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    const uint d           = gid.x;
+    const uint kv_head_idx = gid.y;
+    const uint batch_idx   = gid.z;
+    const uint gqa_ratio   = num_heads / num_kv_heads;
+    const uint lane        = d;
+
+    if (d >= head_dim || kv_head_idx >= num_kv_heads || batch_idx >= batch_size) return;
+
+    const uint seq_len = seq_lengths[batch_idx];
+    const float scale = 1.0f / sqrt(float(head_dim));
+    const uint window_start = (window_size > 0 && seq_len > window_size) ? seq_len - window_size : 0;
+
+    device const int* block_table = block_tables + batch_idx * max_num_blocks;
+
+    uint num_logical_blocks = (seq_len + block_size - 1u) / block_size;
+    if (num_logical_blocks > max_num_blocks) num_logical_blocks = max_num_blocks;
+    uint start_logical_block = window_start / block_size;
+
+    float m_i_arr[8];
+    float l_i_arr[8];
+    float acc_o_arr[8];
+    for (uint h = 0u; h < gqa_ratio; h++) {
+        m_i_arr[h] = -INFINITY;
+        l_i_arr[h] = 0.0f;
+        acc_o_arr[h] = 0.0f;
+    }
+
+    for (uint logical_block = start_logical_block; logical_block < num_logical_blocks; logical_block++) {
+        int physical_block = block_table[logical_block];
+        device const float* K_block = K_pool + physical_block * block_size * num_kv_heads * head_dim;
+        device const float* V_block = V_pool + physical_block * block_size * num_kv_heads * head_dim;
+
+        uint block_start = logical_block * block_size;
+        uint block_end = min(block_start + block_size, seq_len);
+
+        for (uint j = block_start; j < block_end; j++) {
+            if (j < window_start) continue;
+            uint local_j = j - block_start;
+            device const float* K_token = K_block + local_j * num_kv_heads * head_dim + kv_head_idx * head_dim;
+            device const float* V_token = V_block + local_j * num_kv_heads * head_dim + kv_head_idx * head_dim;
+
+            float k_val = K_token[d];
+            float v_val = V_token[d];
+
+            for (uint h = 0u; h < gqa_ratio; h++) {
+                const uint head_idx = kv_head_idx * gqa_ratio + h;
+                device const float* q_vec = Q + (batch_idx * num_heads + head_idx) * head_dim;
+
+                float partial = q_vec[d] * k_val;
+                for (uint stride = 32u; stride < head_dim; stride += 32u) {
+                    partial += q_vec[d + stride] * K_token[d + stride];
+                }
+                partial += simd_shuffle_xor(partial, 1);
+                partial += simd_shuffle_xor(partial, 2);
+                partial += simd_shuffle_xor(partial, 4);
+                partial += simd_shuffle_xor(partial, 8);
+                partial += simd_shuffle_xor(partial, 16);
+                float dot = partial * scale;
+
+                float m_old = m_i_arr[h];
+                m_i_arr[h] = max(m_old, dot);
+                float corr = exp(m_old - m_i_arr[h]);
+                float exp_dot = exp(dot - m_i_arr[h]);
+                l_i_arr[h] = l_i_arr[h] * corr + exp_dot;
+                acc_o_arr[h] = acc_o_arr[h] * corr + exp_dot * v_val;
+            }
+        }
+    }
+
+    for (uint h = 0u; h < gqa_ratio; h++) {
+        const uint head_idx = kv_head_idx * gqa_ratio + h;
+        O[(batch_idx * num_heads + head_idx) * head_dim + d] = acc_o_arr[h] / l_i_arr[h];
+    }
 }
 
 
@@ -1414,9 +2133,10 @@ kernel void paged_attention_fused_prefill_f32(
                 float m_old = m_i;
                 m_i = max(m_i, dot);
                 float correction = exp(m_old - m_i);
-                l_i = l_i * correction + exp(dot - m_i);
+                float exp_dot = exp(dot - m_i);
+                l_i = l_i * correction + exp_dot;
                 acc_o = acc_o * correction;
-                acc_o += exp(dot - m_i) * V_tile[local_j * head_dim + col];
+                acc_o += exp_dot * V_tile[local_j * head_dim + col];
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1526,9 +2246,10 @@ kernel void paged_attention_fused_prefill_f16(
                 float m_old = m_i;
                 m_i = max(m_i, dot);
                 float correction = exp(m_old - m_i);
-                l_i = l_i * correction + exp(dot - m_i);
+                float exp_dot = exp(dot - m_i);
+                l_i = l_i * correction + exp_dot;
                 acc_o = acc_o * correction;
-                acc_o += exp(dot - m_i) * V_tile[local_j * head_dim + col];
+                acc_o += exp_dot * V_tile[local_j * head_dim + col];
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1681,9 +2402,10 @@ kernel void paged_attention_fused_prefill_fp8(
                 float m_old = m_i;
                 m_i = max(m_i, dot);
                 float correction = exp(m_old - m_i);
-                l_i = l_i * correction + exp(dot - m_i);
+                float exp_dot = exp(dot - m_i);
+                l_i = l_i * correction + exp_dot;
                 acc_o = acc_o * correction;
-                acc_o += exp(dot - m_i) * V_tile[local_j * head_dim + col];
+                acc_o += exp_dot * V_tile[local_j * head_dim + col];
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

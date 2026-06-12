@@ -7,3 +7,4 @@ Benchmarks/Results/
 *.xcodeproj
 *.xcworkspace
 Pods/
+default.metallib
