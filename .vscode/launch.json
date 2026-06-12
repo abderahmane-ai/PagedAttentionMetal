@@ -79,6 +79,26 @@
             "target": "MLXDemo",
             "configuration": "release",
             "preLaunchTask": "swift: Build Release MLXDemo"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:PagedAttentionMetal}",
+            "name": "Debug Profiler",
+            "target": "Profiler",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug Profiler"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:PagedAttentionMetal}",
+            "name": "Release Profiler",
+            "target": "Profiler",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release Profiler"
         }
     ]
 }

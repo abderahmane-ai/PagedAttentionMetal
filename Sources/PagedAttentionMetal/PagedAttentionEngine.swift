@@ -963,9 +963,8 @@ public class PagedAttentionEngine: @unchecked Sendable {
             let hd = headDim
             enc.setThreadgroupMemoryLength(32 * hd * MemoryLayout<Float16>.stride, index: 0)
             enc.setThreadgroupMemoryLength(32 * 16 * MemoryLayout<Float16>.stride, index: 1)
-            enc.setThreadgroupMemoryLength(32 * 16 * MemoryLayout<Float>.stride, index: 2)
-            enc.setThreadgroupMemoryLength(32 * hd * MemoryLayout<Float>.stride, index: 3)
-            enc.setThreadgroupMemoryLength(64 * MemoryLayout<Float>.stride, index: 4)
+            enc.setThreadgroupMemoryLength(32 * hd * MemoryLayout<Float>.stride, index: 2)
+            enc.setThreadgroupMemoryLength(64 * MemoryLayout<Float>.stride, index: 3)
 
             let gqaRatio = numHeads / numKVHeads
             let rowsPerHead = 32 / gqaRatio
@@ -1564,11 +1563,10 @@ public class PagedAttentionEngine: @unchecked Sendable {
                 enc.setBytes(&blockSizeVar, length: 4, index: 8)
                 enc.setBytes(&windowStartVar, length: 4, index: 9)
 
-                enc.setThreadgroupMemoryLength(32 * 64 * MemoryLayout<Float16>.stride, index: 0)
+                enc.setThreadgroupMemoryLength(32 * headDim * MemoryLayout<Float16>.stride, index: 0)
                 enc.setThreadgroupMemoryLength(32 * 16 * MemoryLayout<Float16>.stride, index: 1)
-                enc.setThreadgroupMemoryLength(32 * 16 * MemoryLayout<Float>.stride, index: 2)
-                enc.setThreadgroupMemoryLength(32 * 64 * MemoryLayout<Float>.stride, index: 3)
-                enc.setThreadgroupMemoryLength(64 * MemoryLayout<Float>.stride, index: 4)
+                enc.setThreadgroupMemoryLength(32 * headDim * MemoryLayout<Float>.stride, index: 2)
+                enc.setThreadgroupMemoryLength(64 * MemoryLayout<Float>.stride, index: 3)
 
                 let gqaRatio = numHeads / numKVHeads
                 let rowsPerHead = 32 / gqaRatio

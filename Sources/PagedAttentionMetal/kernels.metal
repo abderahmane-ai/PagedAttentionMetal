@@ -224,9 +224,8 @@ kernel void flash_attention_mma_f16(
 
     threadgroup half  *Q_tile_ptr  [[threadgroup(0)]],
     threadgroup half  *P_tile_ptr  [[threadgroup(1)]],
-    threadgroup float *S_tile_ptr  [[threadgroup(2)]],
-    threadgroup float *O_tile_ptr  [[threadgroup(3)]],
-    threadgroup float *ml_i_ptr    [[threadgroup(4)]]
+    threadgroup float *O_tile_ptr  [[threadgroup(2)]],
+    threadgroup float *ml_i_ptr    [[threadgroup(3)]]
 ) {
     constexpr uint BQ = 32;
     constexpr uint BK = 16;
@@ -279,6 +278,7 @@ kernel void flash_attention_mma_f16(
         device const half* Kb = K_pool + pb * BK * num_kv_heads * head_dim;
         device const half* Vb = V_pool + pb * BK * num_kv_heads * head_dim;
 
+        float S_local[BK];
         {
             const uint qrow_in_sg = (tid % 32) / 8;
             const uint d_chunk = (tid % 32) % 8;
@@ -297,14 +297,9 @@ kernel void flash_attention_mma_f16(
                 red += simd_shuffle_xor(red, 1);
                 red += simd_shuffle_xor(red, 2);
                 red += simd_shuffle_xor(red, 4);
-                if (d_chunk == 0)
-                    S_tile_ptr[q_row * BK + kt] = red;
+                S_local[kt] = red * scale;
             }
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint s = tid; s < BQ * BK; s += 256) S_tile_ptr[s] *= scale;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         {
             uint row = tid / 8;
@@ -317,7 +312,7 @@ kernel void flash_attention_mma_f16(
                 float S[2];
                 for (uint i = 0; i < 2; i++) {
                     uint j = es + i;
-                    float sv = S_tile_ptr[row * BK + j];
+                    float sv = S_local[j];
                     if (causal && k_block + j > q_start + row) sv = -INFINITY;
                     S[i] = sv;
                 }
@@ -350,7 +345,6 @@ kernel void flash_attention_mma_f16(
                     P_tile_ptr[row * BK + es + i] = half(S[i]);
             }
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         {
             uint qr = sg_row * 8;
