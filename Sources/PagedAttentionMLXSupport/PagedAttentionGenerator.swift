@@ -22,32 +22,48 @@ private final class CacheHolder: @unchecked Sendable {
     }
 }
 
+/// Protocol defining the interface for adapting external models (e.g. Llama)
+/// to the custom PagedAttention projection and generation structures.
 public protocol ModelAdapterProtocol: AnyObject, Sendable {
+    /// Hidden dimension size of the model.
     var hiddenSize: Int { get }
+    /// Vocabulary size of the model.
     var vocabSize: Int { get }
+    /// Number of attention layers in the model.
     var numLayers: Int { get }
+    /// Specifications of each layer.
     var layerSpecs: [PagedLayerSpec] { get }
 
+    /// Converts token identifiers into hidden state embeddings.
     func embed(tokens: [Int]) throws -> MLXArray
 
-    /// Applies input layer norm, rotary position embedding, and Q/K/V projection as MTLBuffers.
+    /// Projects embedded states into Metal query, key, and value buffers.
     func projectQKV(hidden: MLXArray, layer: Int, offset: Int) throws -> (q: MTLBuffer, k: MTLBuffer, v: MTLBuffer)
 
-    /// Applies wo projection, residual add, post-attention layernorm, and MLP.
-    /// `hidden` is the pre-attention hidden state, `attentionFloats` is the raw
-    /// engine output in shape [seqLen, numHeads * headDim].
+    /// Applies projection weight parameters, residual addition, layernorm, and MLP steps to the output of attention computation.
     func applyAttentionOutput(hidden: MLXArray, attentionFloats: [Float], layer: Int) throws -> MLXArray
 
-    /// Applies final RMSNorm and lm_head projection.
+    /// Evaluates final normalization and lm_head projection to return prediction logits.
     func projectOutput(hidden: MLXArray) throws -> MLXArray
 }
 
+/// Facilitates token-by-token generation for adapted MLX models using the optimized PagedAttention execution pipeline.
 public class PagedAttentionGenerator: @unchecked Sendable {
+    /// The coordinated PagedAttention inference orchestrator.
     public let inference: PagedAttentionInference
+    /// The adapter configured for mapping the target LLM architecture weights.
     public let modelAdapter: ModelAdapterProtocol
+    /// Configuration variables controlling text generation options.
     public let samplingConfig: SamplingConfig
+    /// The Metal device.
     public let device: MTLDevice
 
+    /// Initializes a new generator instance.
+    ///
+    /// - Parameters:
+    ///   - inference: The coordinated inference instance.
+    ///   - modelAdapter: The adapter mapping the model's weight configurations.
+    ///   - samplingConfig: Text generation settings (e.g. temperature, repetition penalty).
     public init(
         inference: PagedAttentionInference,
         modelAdapter: ModelAdapterProtocol,
@@ -59,6 +75,13 @@ public class PagedAttentionGenerator: @unchecked Sendable {
         self.device = inference.device
     }
 
+    /// Asynchronously streams generated token identifiers.
+    ///
+    /// - Parameters:
+    ///   - promptTokens: Array of input token IDs representing the generation prompt.
+    ///   - maxNewTokens: Maximum count of new tokens to produce.
+    ///   - overrideConfig: Optional override configurations for text generation.
+    /// - Returns: An asynchronous throwing stream of generated token IDs.
     public func generate(
         promptTokens: [Int],
         maxNewTokens: Int,
@@ -89,9 +112,6 @@ public class PagedAttentionGenerator: @unchecked Sendable {
                         return
                     }
 
-                    // NOTE: This creates per-layer KVCacheManagers with their own memory pools,
-                    // separate from inference.cache. Total memory = inference.cache.maxBlocks + numLayers * perLayerBlocks.
-                    // This is a known limitation; a future refactor should share a single pool.
                     let perLayerBlocks = max(1, inference.cache.maxBlocks / max(1, modelAdapter.numLayers))
                     let newCaches = try (0..<modelAdapter.numLayers).map { _ in
                         let firstSpec = modelAdapter.layerSpecs[0]
@@ -160,7 +180,6 @@ public class PagedAttentionGenerator: @unchecked Sendable {
                     continuation.yield(lastToken)
 
                     for _ in 1..<maxNewTokens {
-                        // Check for cancellation
                         if Task.isCancelled {
                             inference.completeSequence(id: seqID)
                             continuation.finish(throwing: CancellationError())

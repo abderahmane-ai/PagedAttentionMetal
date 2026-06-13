@@ -2,25 +2,47 @@ import Foundation
 import Metal
 import os
 
+/// High-level orchestration manager that coordinates the `PagedAttentionEngine`,
+/// the `BatchKVCacheManager`, and the `ContinuousBatchingScheduler` for executing LLM batch inference.
 public final class PagedAttentionInference: @unchecked Sendable {
+    /// The underlying Metal kernel execution engine.
     public let engine: PagedAttentionEngine
+    /// The batched KV cache manager that handles block allocations.
     public let cache: BatchKVCacheManager
+    /// The batching scheduler responsible for prioritizing prefill and decode sequences.
     public let scheduler: ContinuousBatchingScheduler
 
+    /// The active Metal device utilized for memory allocation and GPU compute.
     public let device: MTLDevice
-    public let layerSpecs: [PagedLayerSpec]
+    /// Configuration specs for all layers inside the attention model.
+    public var layerSpecs: [PagedLayerSpec]
 
+    /// The maximum number of sequences that can be batch processed simultaneously.
     public let maxBatchSize: Int
+    /// Number of attention layers in the model configuration.
     public let numLayers: Int
 
+    /// Callback invoked whenever a new token is generated.
+    /// Parameters are: `(sequenceId: Int, tokenId: Int)`.
     public var onTokenGenerated: ((Int, Int) -> Void)?
 
     private var prefilledSequences: Set<Int> = []
     private let lock: UnsafeMutablePointer<os_unfair_lock>
     private var _totalTokensGenerated: Int = 0
 
+    /// Counter tracking the total number of inference steps processed.
     public private(set) var stepCount: Int = 0
 
+    /// Initializes a new instance of the inference coordinator.
+    ///
+    /// - Parameters:
+    ///   - device: The Metal device.
+    ///   - maxBlocks: Maximum number of cache blocks to allocate.
+    ///   - blockSize: The size of each block (in tokens). Default is `16`.
+    ///   - layerSpecs: A list of specifications for each model layer.
+    ///   - maxBatchSize: The maximum capacity of concurrently batched decodes. Default is `16`.
+    ///   - maxSequences: The maximum number of sequences tracking at once. Default is `128`.
+    ///   - memoryFraction: Fraction of memory dedicated to the block pool. Default is `0.75`.
     public init(
         device: MTLDevice,
         maxBlocks: Int,
@@ -69,11 +91,20 @@ public final class PagedAttentionInference: @unchecked Sendable {
         lock.deallocate()
     }
 
+    /// Registers a new token generation request to the batch scheduler.
+    ///
+    /// - Parameters:
+    ///   - promptTokenCount: The count of tokens in the input prompt.
+    ///   - maxNewTokens: The maximum count of new tokens to generate.
+    /// - Returns: The assigned sequence identifier (ID).
     @discardableResult
     public func addRequest(promptTokenCount: Int, maxNewTokens: Int) -> Int {
         scheduler.addRequest(promptTokenCount: promptTokenCount, maxNewTokens: maxNewTokens)
     }
 
+    /// Closes a sequence context, releasing its assigned cache resources.
+    ///
+    /// - Parameter id: The sequence ID.
     public func completeSequence(id: Int) {
         scheduler.completeSequence(id: id)
         cache.freeSequence(id: id)
@@ -82,6 +113,9 @@ public final class PagedAttentionInference: @unchecked Sendable {
         os_unfair_lock_unlock(lock)
     }
 
+    /// Executes a single batch generation step, processing prefill and decode sequences in parallel.
+    ///
+    /// - Returns: A list of sequences currently being processed in this step.
     public func step() throws -> [SchedulerSequence] {
         let batch = scheduler.step()
         guard !batch.isEmpty else { return [] }
@@ -113,6 +147,7 @@ public final class PagedAttentionInference: @unchecked Sendable {
         return batch
     }
 
+    /// Runs generation continuously until all registered requests complete.
     public func runAll() throws {
         while waitingCount > 0 || runningCount > 0 {
             let batch = try step()
@@ -120,10 +155,14 @@ public final class PagedAttentionInference: @unchecked Sendable {
         }
     }
 
+    /// Number of sequences waiting in the queue.
     public var waitingCount: Int { scheduler.waitingCount }
+    /// Number of sequences currently running.
     public var runningCount: Int { scheduler.runningCount }
+    /// Number of sequences completed since launch.
     public var completedCount: Int { scheduler.completedCount }
 
+    /// Cumulative total of all tokens generated across active and completed requests.
     public var totalTokensGenerated: Int {
         os_unfair_lock_lock(lock)
         defer { os_unfair_lock_unlock(lock) }
@@ -240,7 +279,6 @@ public final class PagedAttentionInference: @unchecked Sendable {
 
     private func ensureBlocksAvailable(_ needed: Int) throws {
         guard cache.availableBlocks >= needed else {
-            // Not enough blocks, try to preempt
             let preempted = scheduler.handleMemoryPressure(
                 requiredBlocks: needed,
                 availableBlocks: cache.availableBlocks

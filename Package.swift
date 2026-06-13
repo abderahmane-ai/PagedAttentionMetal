@@ -30,6 +30,9 @@ let package = Package(
         .executable(
             name: "PagedAttentionServer",
             targets: ["PagedAttentionServer"]),
+        .executable(
+            name: "SwiftInferenceDemo",
+            targets: ["SwiftInferenceDemo"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.31.0"),
@@ -103,6 +106,17 @@ let package = Package(
                 .product(name: "NIOHTTP1", package: "swift-nio"),
             ],
             path: "Sources/PagedAttentionServer"
+        ),
+        .executableTarget(
+            name: "SwiftInferenceDemo",
+            dependencies: [
+                "PagedAttentionMetal",
+                "PagedAttentionMLXSupport",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+            ],
+            path: "Examples",
+            exclude: ["test_server_client.py"]
         ),
         .testTarget(
             name: "PagedAttentionMetalTests",

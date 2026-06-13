@@ -12,6 +12,78 @@ import NIOHTTP1
 import PagedAttentionMetal
 import PagedAttentionMLXSupport
 
+final class RateLimiter: @unchecked Sendable {
+    private let limit: Int
+    private let windowSize: TimeInterval
+    private let lock = NSLock()
+    private var clientRequests: [String: [Date]] = [:]
+
+    init(limit: Int, windowSize: TimeInterval = 60.0) {
+        self.limit = limit
+        self.windowSize = windowSize
+    }
+
+    func isAllowed(clientKey: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let now = Date()
+        let cutoff = now.addingTimeInterval(-windowSize)
+
+        var requests = clientRequests[clientKey] ?? []
+        requests = requests.filter { $0 > cutoff }
+
+        if requests.count < limit {
+            requests.append(now)
+            clientRequests[clientKey] = requests
+            return true
+        } else {
+            clientRequests[clientKey] = requests
+            return false
+        }
+    }
+}
+
+final class ServerMetrics: @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var totalRequests: Int = 0
+    private(set) var activeRequests: Int = 0
+    private(set) var unauthorizedRequests: Int = 0
+    private(set) var rateLimitedRequests: Int = 0
+    private(set) var errorRequests: Int = 0
+
+    func incrementTotal() {
+        lock.lock()
+        totalRequests += 1
+        activeRequests += 1
+        lock.unlock()
+    }
+
+    func decrementActive() {
+        lock.lock()
+        activeRequests = max(0, activeRequests - 1)
+        lock.unlock()
+    }
+
+    func incrementUnauthorized() {
+        lock.lock()
+        unauthorizedRequests += 1
+        lock.unlock()
+    }
+
+    func incrementRateLimited() {
+        lock.lock()
+        rateLimitedRequests += 1
+        lock.unlock()
+    }
+
+    func incrementError() {
+        lock.lock()
+        errorRequests += 1
+        lock.unlock()
+    }
+}
+
 final class CompletionHandler: @unchecked Sendable, ChannelInboundHandler {
     typealias InboundIn = HTTPServerRequestPart
     typealias OutboundOut = HTTPServerResponsePart
@@ -19,17 +91,26 @@ final class CompletionHandler: @unchecked Sendable, ChannelInboundHandler {
     private let inference: PagedAttentionInference
     private let generator: PagedAttentionGenerator
     private let tokenizer: MLXLMCommon.Tokenizer
+    private let rateLimiter: RateLimiter?
+    private let apiKey: String?
+    private let metrics: ServerMetrics
     private var requestState: [ObjectIdentifier: (head: HTTPRequestHead, body: Data)] = [:]
     private let stateLock = NSLock()
 
     init(
         inference: PagedAttentionInference,
         generator: PagedAttentionGenerator,
-        tokenizer: MLXLMCommon.Tokenizer
+        tokenizer: MLXLMCommon.Tokenizer,
+        rateLimiter: RateLimiter?,
+        apiKey: String?,
+        metrics: ServerMetrics
     ) {
         self.inference = inference
         self.generator = generator
         self.tokenizer = tokenizer
+        self.rateLimiter = rateLimiter
+        self.apiKey = apiKey
+        self.metrics = metrics
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -64,20 +145,91 @@ final class CompletionHandler: @unchecked Sendable, ChannelInboundHandler {
     }
 
     private func handleRequest(context: ChannelHandlerContext, head: HTTPRequestHead, body: Data) {
+        metrics.incrementTotal()
         switch (head.method, head.uri) {
         case (.POST, "/v1/completions"):
+            var isAuthorized = false
+            if let apiKey {
+                if let authHeader = head.headers.first(name: "Authorization"),
+                   authHeader.starts(with: "Bearer ") {
+                    let token = authHeader.dropFirst("Bearer ".count)
+                    if token == apiKey {
+                        isAuthorized = true
+                    }
+                }
+            } else {
+                isAuthorized = true
+            }
+
+            if !isAuthorized {
+                metrics.incrementUnauthorized()
+                metrics.decrementActive()
+                sendJSON(context: context, status: .unauthorized, dict: ["error": "Unauthorized: Invalid or missing API key"])
+                return
+            }
+
+            let clientKey = context.channel.remoteAddress?.ipAddress ?? "unknown"
+            if let rateLimiter, !rateLimiter.isAllowed(clientKey: clientKey) {
+                metrics.incrementRateLimited()
+                metrics.decrementActive()
+                sendJSON(context: context, status: .tooManyRequests, dict: ["error": "Too Many Requests: Rate limit exceeded"])
+                return
+            }
+
             handleCompletions(context: context, body: body)
         case (.GET, "/health"):
+            metrics.decrementActive()
             sendJSON(context: context, status: .ok, dict: ["status": "ok"])
+        case (.GET, "/metrics"), (.GET, "/stats"):
+            metrics.decrementActive()
+            handleMetrics(context: context)
         default:
+            metrics.decrementActive()
             sendJSON(context: context, status: .notFound, dict: ["error": "not found"])
         }
+    }
+
+    private func handleMetrics(context: ChannelHandlerContext) {
+        let stats = inference.cache.memoryStats()
+        let evictionStr: String
+        switch stats.evictionPolicy {
+        case .fifo: evictionStr = "fifo"
+        case .lifo: evictionStr = "lifo"
+        case .bestFit: evictionStr = "bestFit"
+        }
+
+        let dict: [String: Any] = [
+            "server": [
+                "total_requests": metrics.totalRequests,
+                "active_requests": metrics.activeRequests,
+                "unauthorized_requests": metrics.unauthorizedRequests,
+                "rate_limited_requests": metrics.rateLimitedRequests,
+                "error_requests": metrics.errorRequests
+            ],
+            "kv_cache": [
+                "total_blocks": stats.totalBlocks,
+                "used_blocks": stats.usedBlocks,
+                "free_blocks": stats.freeBlocks,
+                "active_sequences": stats.activeSequences,
+                "total_memory_bytes": stats.totalMemoryBytes,
+                "used_memory_bytes": stats.usedMemoryBytes,
+                "partially_filled_blocks": stats.partiallyFilledBlocks,
+                "fragmentation_ratio": stats.fragmentationRatio,
+                "prefix_cache_hits": stats.prefixCacheHits,
+                "prefix_cache_entries": stats.prefixCacheEntries,
+                "shared_blocks": stats.sharedBlocks,
+                "eviction_policy": evictionStr
+            ]
+        ]
+        sendJSON(context: context, status: .ok, dict: dict)
     }
 
     private func handleCompletions(context: ChannelHandlerContext, body: Data) {
         do {
             guard let json = try JSONSerialization.jsonObject(with: body) as? [String: Any],
                   let prompt = json["prompt"] as? String else {
+                metrics.incrementError()
+                metrics.decrementActive()
                 sendJSON(context: context, status: .badRequest, dict: ["error": "prompt required"])
                 return
             }
@@ -89,18 +241,26 @@ final class CompletionHandler: @unchecked Sendable, ChannelInboundHandler {
             let stream      = json["stream"]      as? Bool   ?? false
 
             guard maxTokens >= 0 else {
+                metrics.incrementError()
+                metrics.decrementActive()
                 sendJSON(context: context, status: .badRequest, dict: ["error": "max_tokens must be non-negative"])
                 return
             }
             guard (0...2).contains(temperature) else {
+                metrics.incrementError()
+                metrics.decrementActive()
                 sendJSON(context: context, status: .badRequest, dict: ["error": "temperature must be between 0 and 2"])
                 return
             }
             guard (0...1).contains(topP) else {
+                metrics.incrementError()
+                metrics.decrementActive()
                 sendJSON(context: context, status: .badRequest, dict: ["error": "top_p must be between 0 and 1"])
                 return
             }
             guard topK > 0 else {
+                metrics.incrementError()
+                metrics.decrementActive()
                 sendJSON(context: context, status: .badRequest, dict: ["error": "top_k must be positive"])
                 return
             }
@@ -147,6 +307,7 @@ final class CompletionHandler: @unchecked Sendable, ChannelInboundHandler {
                 respHead.headers.add(name: "Content-Type", value: "text/event-stream")
                 respHead.headers.add(name: "Cache-Control", value: "no-cache")
                 respHead.headers.add(name: "Connection", value: "keep-alive")
+                respHead.headers.add(name: "Access-Control-Allow-Origin", value: "*")
                 context.write(wrapOutboundOut(.head(respHead)), promise: nil)
 
                 eventLoop.execute {
@@ -168,6 +329,7 @@ final class CompletionHandler: @unchecked Sendable, ChannelInboundHandler {
                             }
                             writer.sendEvent("data: [DONE]\n\n")
                         } catch {
+                            self.metrics.incrementError()
                             let msg = String(describing: error)
                                 .replacingOccurrences(of: "\\", with: "\\\\")
                                 .replacingOccurrences(of: "\"", with: "\\\"")
@@ -176,6 +338,7 @@ final class CompletionHandler: @unchecked Sendable, ChannelInboundHandler {
                                 .replacingOccurrences(of: "\t", with: "\\t")
                             writer.sendEvent("data: {\"error\":\"\(msg)\"}\n\n")
                         }
+                        self.metrics.decrementActive()
                         writer.sendEnd()
                     }
                 }
@@ -195,12 +358,16 @@ final class CompletionHandler: @unchecked Sendable, ChannelInboundHandler {
                                 "usage": ["completion_tokens": tokens.count]
                             ])
                         } catch {
+                            self.metrics.incrementError()
                             writer.sendJSON(.internalServerError, ["error": "\(error)"])
                         }
+                        self.metrics.decrementActive()
                     }
                 }
             }
         } catch {
+            metrics.incrementError()
+            metrics.decrementActive()
             sendJSON(context: context, status: .internalServerError, dict: ["error": "\(error)"])
         }
     }
@@ -322,6 +489,17 @@ struct PagedAttentionServer {
     static func main() async throws {
         let device = MTLCreateSystemDefaultDevice()!
 
+        let portEnv = ProcessInfo.processInfo.environment["PORT"] ?? ProcessInfo.processInfo.environment["SERVER_PORT"] ?? "8080"
+        let port = Int(portEnv) ?? 8080
+
+        let apiKey = ProcessInfo.processInfo.environment["PAGED_ATTENTION_API_KEY"]
+
+        let rateLimitEnv = ProcessInfo.processInfo.environment["RATE_LIMIT_RPM"] ?? "60"
+        let rateLimit = Int(rateLimitEnv) ?? 60
+        let rateLimiter = rateLimit > 0 ? RateLimiter(limit: rateLimit) : nil
+
+        let sharedMetrics = ServerMetrics()
+
         var adapter: ModelAdapterProtocol
         var tokenizer: MLXLMCommon.Tokenizer
 
@@ -364,7 +542,10 @@ struct PagedAttentionServer {
                 let handler = CompletionHandler(
                     inference: inference,
                     generator: generator,
-                    tokenizer: capturedTokenizer
+                    tokenizer: capturedTokenizer,
+                    rateLimiter: rateLimiter,
+                    apiKey: apiKey,
+                    metrics: sharedMetrics
                 )
                 return channel.pipeline.configureHTTPServerPipeline().flatMap {
                     channel.pipeline.addHandler(handler)
@@ -373,10 +554,17 @@ struct PagedAttentionServer {
             .childChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
             .childChannelOption(ChannelOptions.maxMessagesPerRead, value: 1)
 
-        let channel = try await bootstrap.bind(host: "0.0.0.0", port: 8080).get()
-        print("PagedAttention server listening on http://localhost:8080")
+        let channel = try await bootstrap.bind(host: "0.0.0.0", port: port).get()
+        print("PagedAttention server listening on http://localhost:\(port)")
         print("  POST /v1/completions")
         print("  GET  /health")
+        print("  GET  /metrics")
+        if let apiKey {
+            print("  Enforcing token authentication (API Key configured)")
+        }
+        if rateLimit > 0 {
+            print("  Rate Limiting active: \(rateLimit) requests per minute per IP")
+        }
         try await channel.closeFuture.get()
     }
 }

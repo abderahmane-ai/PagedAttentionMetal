@@ -77,6 +77,8 @@ private final class CommandBufferManager: @unchecked Sendable {
     }
 }
 
+/// An optimized compute execution engine that dispatches Metal compute pipelines
+/// for PagedAttention algorithms (prefill, decode, block updates) on Apple Silicon GPUs.
 public class PagedAttentionEngine: @unchecked Sendable {
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
@@ -111,12 +113,19 @@ public class PagedAttentionEngine: @unchecked Sendable {
     private let fusedPrefillPipelineF16: MTLComputePipelineState
     private let fusedPrefillPipelineFP8: MTLComputePipelineState
 
+    /// The threshold (in tokens) above which prefill operations fall back to a multi-pass tiled pipeline.
     public var splitThreshold: Int = 1024
+    /// Default sliding window size for local attention.
     public var defaultWindowSize: Int = 0
+    /// Default chunk size for chunked prefill attention.
     public var defaultChunkSize: Int = 0
+    /// The memory fraction of the system unified memory budget used for recommending blocks.
     public private(set) var memoryFraction: Float = 0.75
+    /// Recommended total number of blocks for this device.
     public private(set) var recommendedBlockCount: Int = 0
+    /// Maximum number of retries for GPU execution error recovery.
     public var maxRetries: Int = 3
+    /// Whether to enable graceful degradation path under execution memory pressures.
     public var enableGracefulDegradation: Bool = true
 
     private var _lastStats: PagedAttentionStats = .empty
@@ -124,18 +133,21 @@ public class PagedAttentionEngine: @unchecked Sendable {
     private var consecutiveFailures: Int = 0
     private let lock = OSAllocatedUnfairLock()
 
+    /// Performance statistics of the last executed attention operation.
     public var lastStats: PagedAttentionStats {
         lock.lock()
         defer { lock.unlock() }
         return _lastStats
     }
 
+    /// The last encountered engine execution error, if any.
     public var lastError: PagedAttentionError? {
         lock.lock()
         defer { lock.unlock() }
         return _lastError
     }
 
+    /// The default compiled or source MTLLibrary for kernels.
     public static var defaultLibrary: MTLLibrary {
         get throws {
             if let url = Bundle.module.url(forResource: "kernels", withExtension: "metallib"),
@@ -159,6 +171,7 @@ public class PagedAttentionEngine: @unchecked Sendable {
         }
     }
 
+    /// Helper to compile or load the library on the specified Metal device.
     public static func makeDefaultLibrary(device: MTLDevice) throws -> MTLLibrary {
         // Try precompiled .metallib first (faster startup)
         if let url = Bundle.module.url(forResource: "kernels", withExtension: "metallib"),
@@ -184,6 +197,7 @@ public class PagedAttentionEngine: @unchecked Sendable {
         }
     }
 
+    /// Recommends the maximum number of blocks that can be allocated given a specific memory limit fraction.
     public static func recommendedMaxBlocks(
         device: MTLDevice,
         blockSize: Int,
@@ -202,6 +216,7 @@ public class PagedAttentionEngine: @unchecked Sendable {
         return max(1, maxBlocks)
     }
 
+    /// Gathers structural information about the active GPU device.
     public static func gpuInfo(device: MTLDevice) -> String {
         var families = [String]()
         let appleFamilies: [(MTLGPUFamily, String)] = [
@@ -229,6 +244,7 @@ public class PagedAttentionEngine: @unchecked Sendable {
         """
     }
 
+    /// Initializes a new PagedAttention compute engine, compile-linking all GPU kernels.
     public init() throws {
         guard let device = MTLCreateSystemDefaultDevice(),
               let queue = device.makeCommandQueue() else {
@@ -316,6 +332,7 @@ public class PagedAttentionEngine: @unchecked Sendable {
         self.fusedPrefillPipelineFP8 = try device.makeComputePipelineState(function: funcFusedFP8)
     }
 
+    /// Convenience initializer that automatically determines the recommended blocks.
     public convenience init(
         blockSize: Int = 16,
         headDim: Int,
@@ -382,6 +399,9 @@ public class PagedAttentionEngine: @unchecked Sendable {
         throw lastError!
     }
 
+    /// Executes a prefill operation for a single sequence, processing queries and writing key-values to the block memory pools.
+    ///
+    /// - Parameter request: Struct holding all source buffers and configuration metadata.
     public func prefill(_ request: PagedAttentionPrefillRequest) throws {
         try request.layer.validate()
         try validatePrefill(request)
@@ -507,6 +527,9 @@ public class PagedAttentionEngine: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Executes a decode operation for a batch of sequences, querying and evaluating attention.
+    ///
+    /// - Parameter request: Struct holding all source/destination buffers and metadata.
     public func decode(_ request: PagedAttentionDecodeRequest) throws {
         try request.layer.validate()
         try validateDecode(request)
@@ -556,6 +579,9 @@ public class PagedAttentionEngine: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Appends new KV tokens to the cache memory pool buffers.
+    ///
+    /// - Parameter request: The parameters of the append request.
     public func appendToCache(_ request: PagedKVAppendRequest) throws {
         try request.layer.validate()
         try validateAppend(request)
@@ -601,6 +627,9 @@ public class PagedAttentionEngine: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Executes a fused prefill operation that copies keys/values and calculates attention in a single pass.
+    ///
+    /// - Parameter request: Struct holding all parameters of the fused prefill request.
     public func fusedPrefill(_ request: PagedAttentionFusedPrefillRequest) throws {
         try request.layer.validate()
         guard request.seqLen > 0 else {
@@ -680,6 +709,7 @@ public class PagedAttentionEngine: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Flattened prefill convenience method that bypasses the request struct wrapper.
     public func prefill(
         q: MTLBuffer,
         kPool: MTLBuffer,
@@ -978,6 +1008,7 @@ public class PagedAttentionEngine: @unchecked Sendable {
         }
     }
 
+    /// Flattened decode convenience method that bypasses the request struct wrapper.
     public func decode(
         q: MTLBuffer,
         kPool: MTLBuffer,
@@ -1132,6 +1163,7 @@ public class PagedAttentionEngine: @unchecked Sendable {
         }
     }
 
+    /// Flattened cache append convenience method that bypasses the request struct wrapper.
     public func appendToCache(
         keys: MTLBuffer,
         values: MTLBuffer,
@@ -1305,6 +1337,7 @@ public class PagedAttentionEngine: @unchecked Sendable {
         }
     }
 
+    /// Executes a backward pass to calculate gradients with respect to query, key, and value states.
     public func backward(
         q: MTLBuffer,
         kPool: MTLBuffer,
@@ -1396,6 +1429,7 @@ public class PagedAttentionEngine: @unchecked Sendable {
         }
     }
 
+    /// Executes a prefill operation across multiple model layers sequentially.
     public func prefillLayers(
         qBuffers: [MTLBuffer],
         kPool: MTLBuffer,
@@ -1603,6 +1637,7 @@ public class PagedAttentionEngine: @unchecked Sendable {
         }
     }
 
+    /// Executes a decode operation for a batch of sequences across multiple model layers.
     public func decodeLayers(
         qBuffers: [MTLBuffer],
         kPool: MTLBuffer,
@@ -1705,6 +1740,7 @@ public class PagedAttentionEngine: @unchecked Sendable {
         }
     }
 
+    /// Appends new KV tokens across multiple model layers sequentially.
     public func appendLayers(
         keys: [MTLBuffer],
         values: [MTLBuffer],

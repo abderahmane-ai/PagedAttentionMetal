@@ -43,6 +43,7 @@ public struct LogicalSequence {
     }
 }
 
+/// Manages physical GPU block allocations and mapping details for a single model layer's KV Cache.
 public class KVCacheManager: @unchecked Sendable {
     private static let log = OSLog(subsystem: "com.pagedattentionmetal", category: "kvcache")
 
@@ -377,6 +378,7 @@ public class KVCacheManager: @unchecked Sendable {
     }
 }
 
+/// Manages physical GPU block allocations and multi-sequence mappings for batched inference cache operations.
 public class BatchKVCacheManager: @unchecked Sendable {
     private static let log = OSLog(subsystem: "com.pagedattentionmetal", category: "batchkvcache")
 

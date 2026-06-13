@@ -119,6 +119,26 @@
             "target": "PagedAttentionServer",
             "configuration": "release",
             "preLaunchTask": "swift: Build Release PagedAttentionServer"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:PagedAttentionMetal}",
+            "name": "Debug SwiftInferenceDemo",
+            "target": "SwiftInferenceDemo",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug SwiftInferenceDemo"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:PagedAttentionMetal}",
+            "name": "Release SwiftInferenceDemo",
+            "target": "SwiftInferenceDemo",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release SwiftInferenceDemo"
         }
     ]
 }
