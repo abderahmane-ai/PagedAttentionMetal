@@ -30,7 +30,10 @@ public class LlamaModelAdapter: @unchecked Sendable, ModelAdapterProtocol {
     private let ropeModules: [RoPE]
 
     public init(container: consuming ModelContainer) async throws {
-        self.device = MTLCreateSystemDefaultDevice()!
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw PagedAttentionMLXError.metalDeviceUnavailable
+        }
+        self.device = device
         self.container = container
 
         let extract = try await container.perform { context -> LlamaExtract in
@@ -61,34 +64,34 @@ public class LlamaModelAdapter: @unchecked Sendable, ModelAdapterProtocol {
         self.hiddenSize = emb.weight.shape[1]
 
         let _qProj = modelDict.filter { $0.key.contains(".self_attn.q_proj") }
-            .sorted { layerIndex($0.key) < layerIndex($1.key) }
+            .sorted { Self.layerIndex($0.key) < Self.layerIndex($1.key) }
             .compactMap { $0.value as? Linear }
         let _kProj = modelDict.filter { $0.key.contains(".self_attn.k_proj") }
-            .sorted { layerIndex($0.key) < layerIndex($1.key) }
+            .sorted { Self.layerIndex($0.key) < Self.layerIndex($1.key) }
             .compactMap { $0.value as? Linear }
         let _vProj = modelDict.filter { $0.key.contains(".self_attn.v_proj") }
-            .sorted { layerIndex($0.key) < layerIndex($1.key) }
+            .sorted { Self.layerIndex($0.key) < Self.layerIndex($1.key) }
             .compactMap { $0.value as? Linear }
         let _woProj = modelDict.filter { $0.key.contains(".self_attn.o_proj") }
-            .sorted { layerIndex($0.key) < layerIndex($1.key) }
+            .sorted { Self.layerIndex($0.key) < Self.layerIndex($1.key) }
             .compactMap { $0.value as? Linear }
         let _inputNorm = modelDict.filter { $0.key.contains(".input_layernorm") }
-            .sorted { layerIndex($0.key) < layerIndex($1.key) }
+            .sorted { Self.layerIndex($0.key) < Self.layerIndex($1.key) }
             .compactMap { $0.value as? RMSNorm }
         let _postNorm = modelDict.filter { $0.key.contains(".post_attention_layernorm") }
-            .sorted { layerIndex($0.key) < layerIndex($1.key) }
+            .sorted { Self.layerIndex($0.key) < Self.layerIndex($1.key) }
             .compactMap { $0.value as? RMSNorm }
         let _mlpGate = modelDict.filter { $0.key.contains(".mlp.gate_proj") }
-            .sorted { layerIndex($0.key) < layerIndex($1.key) }
+            .sorted { Self.layerIndex($0.key) < Self.layerIndex($1.key) }
             .compactMap { $0.value as? Linear }
         let _mlpUp = modelDict.filter { $0.key.contains(".mlp.up_proj") }
-            .sorted { layerIndex($0.key) < layerIndex($1.key) }
+            .sorted { Self.layerIndex($0.key) < Self.layerIndex($1.key) }
             .compactMap { $0.value as? Linear }
         let _mlpDown = modelDict.filter { $0.key.contains(".mlp.down_proj") }
-            .sorted { layerIndex($0.key) < layerIndex($1.key) }
+            .sorted { Self.layerIndex($0.key) < Self.layerIndex($1.key) }
             .compactMap { $0.value as? Linear }
         self.ropeModules = modelDict.filter { $0.key.contains(".self_attn.rotary_emb") }
-            .sorted { layerIndex($0.key) < layerIndex($1.key) }
+            .sorted { Self.layerIndex($0.key) < Self.layerIndex($1.key) }
             .compactMap { $0.value as? RoPE }
 
         guard !_qProj.isEmpty, _qProj.count == _kProj.count,
@@ -151,7 +154,7 @@ public class LlamaModelAdapter: @unchecked Sendable, ModelAdapterProtocol {
         return result
     }
 
-    private func layerIndex(_ key: String) -> Int {
+    private static func layerIndex(_ key: String) -> Int {
         guard let range = key.range(of: "model.layers.") else { return Int.max }
         let suffix = key[range.upperBound...]
         let digits = suffix.prefix { $0.isNumber }
@@ -166,7 +169,6 @@ public class LlamaModelAdapter: @unchecked Sendable, ModelAdapterProtocol {
     public func projectQKV(hidden: MLXArray, layer: Int, offset: Int = 0) throws -> (q: MTLBuffer, k: MTLBuffer, v: MTLBuffer) {
         let normed = inputNorm[layer](hidden)
         let h = normed.asType(.float16)
-        let spec = layerSpecs[layer]
         let qArr = qProj[layer](h).asType(.float16)
         let kArr = kProj[layer](h).asType(.float16)
         let vArr = vProj[layer](h).asType(.float16)

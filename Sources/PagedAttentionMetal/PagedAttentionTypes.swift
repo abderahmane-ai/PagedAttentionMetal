@@ -131,7 +131,8 @@ public struct PagedAttentionStats: Sendable, Equatable {
     public enum Operation: String, Sendable {
         case none
         case prefillSinglePass
-        case prefillSplitPass
+        case prefillMMA
+        case prefillFlash
         case prefillTiledPass
         case decode
         case append

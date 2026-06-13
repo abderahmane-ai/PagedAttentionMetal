@@ -3,6 +3,24 @@ import Metal
 import MLX
 import MLXLMCommon
 import PagedAttentionMetal
+import os
+
+private final class CacheHolder: @unchecked Sendable {
+    private let lock = OSAllocatedUnfairLock()
+    private var _caches: [KVCacheManager] = []
+    
+    var caches: [KVCacheManager] {
+        lock.lock()
+        defer { lock.unlock() }
+        return _caches
+    }
+    
+    func setCaches(_ newCaches: [KVCacheManager]) {
+        lock.lock()
+        defer { lock.unlock() }
+        _caches = newCaches
+    }
+}
 
 public protocol ModelAdapterProtocol: AnyObject, Sendable {
     var hiddenSize: Int { get }
@@ -56,9 +74,9 @@ public class PagedAttentionGenerator: @unchecked Sendable {
         }
 
         return AsyncThrowingStream<Int, Error> { [self] continuation in
-            var layerCaches: [KVCacheManager] = []
+            let holder = CacheHolder()
             continuation.onTermination = { @Sendable _ in
-                for cache in layerCaches {
+                for cache in holder.caches {
                     cache.freeSequence(id: seqID)
                 }
             }
@@ -71,8 +89,11 @@ public class PagedAttentionGenerator: @unchecked Sendable {
                         return
                     }
 
+                    // NOTE: This creates per-layer KVCacheManagers with their own memory pools,
+                    // separate from inference.cache. Total memory = inference.cache.maxBlocks + numLayers * perLayerBlocks.
+                    // This is a known limitation; a future refactor should share a single pool.
                     let perLayerBlocks = max(1, inference.cache.maxBlocks / max(1, modelAdapter.numLayers))
-                    layerCaches = try (0..<modelAdapter.numLayers).map { _ in
+                    let newCaches = try (0..<modelAdapter.numLayers).map { _ in
                         let firstSpec = modelAdapter.layerSpecs[0]
                         return try KVCacheManager(
                             device: device,
@@ -83,6 +104,7 @@ public class PagedAttentionGenerator: @unchecked Sendable {
                             dataType: firstSpec.dataType
                         )
                     }
+                    holder.setCaches(newCaches)
 
                     try inference.cache.allocateSequence(id: seqID)
                     try inference.cache.appendTokens(toSequence: seqID, count: promptTokens.count)
@@ -92,7 +114,8 @@ public class PagedAttentionGenerator: @unchecked Sendable {
                     var hiddenStates = embedded
 
                     for layer in 0..<modelAdapter.numLayers {
-                        let cache = layerCaches[layer]
+                        let caches = holder.caches
+                        let cache = caches[layer]
                         try cache.allocateSequence(id: seqID)
                         try cache.appendTokens(toSequence: seqID, count: seqLen)
                         let (qBuf, kBuf, vBuf) = try modelAdapter.projectQKV(hidden: hiddenStates, layer: layer, offset: 0)
@@ -137,12 +160,19 @@ public class PagedAttentionGenerator: @unchecked Sendable {
                     continuation.yield(lastToken)
 
                     for _ in 1..<maxNewTokens {
+                        // Check for cancellation
+                        if Task.isCancelled {
+                            inference.completeSequence(id: seqID)
+                            continuation.finish(throwing: CancellationError())
+                            return
+                        }
                         try inference.cache.appendTokens(toSequence: seqID, count: 1)
                         let currentLen = try inference.cache.getSequenceLength(seqID)
                         var singleHidden = try modelAdapter.embed(tokens: [lastToken])
 
                         for layer in 0..<modelAdapter.numLayers {
-                            let cache = layerCaches[layer]
+                            let caches = holder.caches
+                            let cache = caches[layer]
                             try cache.appendTokens(toSequence: seqID, count: 1)
                             let layerSpec = modelAdapter.layerSpecs[layer]
                             let totalSeqLen = try cache.getSequenceLength(seqID)
@@ -203,7 +233,7 @@ public class PagedAttentionGenerator: @unchecked Sendable {
     private func makeOutputBuffer(tokenCount: Int, layer: PagedLayerSpec) throws -> MTLBuffer {
         let outputSize = tokenCount * layer.numHeads * layer.headDim
         guard let buffer = device.makeBuffer(
-            length: outputSize * layer.qDataTypeByteWidth,
+            length: outputSize * layer.dataType.byteWidth,
             options: .storageModeShared
         ) else {
             throw PagedAttentionError.commandEncodingFailed("attention output buffer")
@@ -227,8 +257,8 @@ public class PagedAttentionGenerator: @unchecked Sendable {
     }
 
     private func makeSeqLengthsBuffer(_ lengths: [UInt32]) throws -> MTLBuffer {
-        guard let buffer = lengths.withUnsafeBytes({
-            device.makeBuffer(bytes: $0.baseAddress!, length: $0.count * MemoryLayout<UInt32>.stride, options: .storageModeShared)
+        guard let buffer = lengths.withUnsafeBytes({ (ptr: UnsafeRawBufferPointer) in
+            device.makeBuffer(bytes: ptr.baseAddress!, length: ptr.count, options: .storageModeShared)
         }) else {
             throw PagedAttentionError.commandEncodingFailed("seq lengths buffer")
         }

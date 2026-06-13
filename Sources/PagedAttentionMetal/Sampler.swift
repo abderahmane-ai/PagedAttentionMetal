@@ -19,12 +19,7 @@ public enum Sampler {
     public static func sample(logits: [Float], config: SamplingConfig, previousTokens: [Int] = []) -> Int {
         var scaled = logits
 
-        if config.repetitionPenalty != 1.0 {
-            for token in previousTokens where token >= 0 && token < scaled.count {
-                scaled[token] *= config.repetitionPenalty
-            }
-        }
-
+        // Apply temperature FIRST (industry standard)
         if config.temperature == 0 {
             return greedy(logits: logits)
         }
@@ -33,6 +28,15 @@ public enum Sampler {
             let invTemp = 1.0 / config.temperature
             for i in scaled.indices {
                 scaled[i] *= invTemp
+            }
+        }
+
+        // Then apply repetition penalty: multiply negative logits, divide positive logits
+        // This correctly decreases probability for both positive and negative logits
+        if config.repetitionPenalty != 1.0 {
+            for token in previousTokens where token >= 0 && token < scaled.count {
+                let logit = scaled[token]
+                scaled[token] = logit < 0 ? logit * config.repetitionPenalty : logit / config.repetitionPenalty
             }
         }
 

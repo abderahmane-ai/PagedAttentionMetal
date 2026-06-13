@@ -99,6 +99,26 @@
             "target": "Profiler",
             "configuration": "release",
             "preLaunchTask": "swift: Build Release Profiler"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:PagedAttentionMetal}",
+            "name": "Debug PagedAttentionServer",
+            "target": "PagedAttentionServer",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug PagedAttentionServer"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:PagedAttentionMetal}",
+            "name": "Release PagedAttentionServer",
+            "target": "PagedAttentionServer",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release PagedAttentionServer"
         }
     ]
 }

@@ -114,7 +114,9 @@ public final class ContinuousBatchingScheduler: @unchecked Sendable {
     }
 
     public func markPrefilled(id: Int) {
-        lock.withLock {}
+        lock.lock()
+        defer { lock.unlock() }
+        sequences[id]?.status = .running
     }
 
     public func markDecoded(id: Int) {

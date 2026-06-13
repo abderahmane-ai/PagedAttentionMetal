@@ -120,7 +120,7 @@ struct PrefillBenchmark {
     }
 
     func runSinglePrefill(config: BenchmarkConfig, name: String = "Prefill") throws -> BenchmarkResult {
-        let cacheManager = KVCacheManager(
+        let cacheManager = try KVCacheManager(
             device: device,
             maxBlocks: 2048,
             blockSize: config.blockSize,

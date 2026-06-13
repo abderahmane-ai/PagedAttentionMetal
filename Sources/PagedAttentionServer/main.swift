@@ -82,6 +82,12 @@ final class CompletionHandler: @unchecked Sendable, ChannelInboundHandler {
                 return
             }
 
+            let maxTokens   = json["max_tokens"]  as? Int    ?? 256
+            let temperature = json["temperature"] as? Float  ?? 1.0
+            let topP        = json["top_p"]       as? Float  ?? 1.0
+            let topK        = json["top_k"]       as? Int    ?? 50
+            let stream      = json["stream"]      as? Bool   ?? false
+
             guard maxTokens >= 0 else {
                 sendJSON(context: context, status: .badRequest, dict: ["error": "max_tokens must be non-negative"])
                 return
@@ -109,28 +115,28 @@ final class CompletionHandler: @unchecked Sendable, ChannelInboundHandler {
                     self.ctx = ctx; self.handler = handler
                 }
                 func sendJSON(_ status: HTTPResponseStatus, _ dict: Any) {
-                    ctx.eventLoop.execute {
+                    self.ctx.eventLoop.execute {
                         var head = HTTPResponseHead(version: .http1_1, status: status)
                         head.headers.add(name: "Content-Type", value: "application/json")
                         head.headers.add(name: "Access-Control-Allow-Origin", value: "*")
-                        ctx.write(handler.wrapOutboundOut(.head(head)), promise: nil)
+                        self.ctx.write(self.handler.wrapOutboundOut(.head(head)), promise: nil)
                         if let data = try? JSONSerialization.data(withJSONObject: dict),
                            let str = String(data: data, encoding: .utf8) {
-                            let buf = ctx.channel.allocator.buffer(string: str)
-                            ctx.write(handler.wrapOutboundOut(.body(.byteBuffer(buf))), promise: nil)
+                            let buf = self.ctx.channel.allocator.buffer(string: str)
+                            self.ctx.write(self.handler.wrapOutboundOut(.body(.byteBuffer(buf))), promise: nil)
                         }
-                        ctx.writeAndFlush(handler.wrapOutboundOut(.end(nil)), promise: nil)
+                        self.ctx.writeAndFlush(self.handler.wrapOutboundOut(.end(nil)), promise: nil)
                     }
                 }
                 func sendEvent(_ line: String) {
-                    ctx.eventLoop.execute {
-                        let buf = ctx.channel.allocator.buffer(string: line)
-                        ctx.writeAndFlush(handler.wrapOutboundOut(.body(.byteBuffer(buf))), promise: nil)
+                    self.ctx.eventLoop.execute {
+                        let buf = self.ctx.channel.allocator.buffer(string: line)
+                        self.ctx.writeAndFlush(self.handler.wrapOutboundOut(.body(.byteBuffer(buf))), promise: nil)
                     }
                 }
                 func sendEnd() {
-                    ctx.eventLoop.execute {
-                        ctx.writeAndFlush(handler.wrapOutboundOut(.end(nil)), promise: nil)
+                    self.ctx.eventLoop.execute {
+                        self.ctx.writeAndFlush(self.handler.wrapOutboundOut(.end(nil)), promise: nil)
                     }
                 }
             }
@@ -220,12 +226,15 @@ final class DummyModelAdapter: @unchecked Sendable, ModelAdapterProtocol {
     let layerSpecs: [PagedLayerSpec]
     let device: MTLDevice
 
-    init(layerSpec: PagedLayerSpec, vocabSize: Int, hiddenSize: Int) {
+    init(layerSpec: PagedLayerSpec, vocabSize: Int, hiddenSize: Int) throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw PagedAttentionError.deviceInitializationFailed
+        }
         self.hiddenSize = hiddenSize
         self.vocabSize = vocabSize
         self.numLayers = 1
         self.layerSpecs = [layerSpec]
-        self.device = MTLCreateSystemDefaultDevice()!
+        self.device = device
     }
 
     func embed(tokens: [Int]) throws -> MLXArray {
@@ -235,13 +244,14 @@ final class DummyModelAdapter: @unchecked Sendable, ModelAdapterProtocol {
                 values[tokenIndex * hiddenSize + dim] = Float((token + dim) % 127) / 127.0 - 0.5
             }
         }
-        return MLXArray(values, [tokens.count, hiddenSize], dtype: .float32)
+        let data = Data(bytes: values, count: values.count * MemoryLayout<Float>.stride)
+        return MLXArray(data, [tokens.count, hiddenSize], dtype: .float32)
     }
 
     func projectQKV(hidden: MLXArray, layer: Int, offset: Int) throws -> (q: MTLBuffer, k: MTLBuffer, v: MTLBuffer) {
         let spec = layerSpecs[layer]
         let seqLen = hidden.shape[0]
-        let qSize = seqLen * spec.numHeads * spec.headDim * spec.qDataTypeByteWidth
+        let qSize = seqLen * spec.numHeads * spec.headDim * spec.dataType.byteWidth
         let kvSize = seqLen * spec.numKVHeads * spec.headDim * spec.dataType.byteWidth
         guard let qBuf = device.makeBuffer(length: qSize, options: .storageModeShared),
               let kBuf = device.makeBuffer(length: kvSize, options: .storageModeShared),
@@ -302,7 +312,8 @@ final class DummyModelAdapter: @unchecked Sendable, ModelAdapterProtocol {
                 logits[offset + token] = value
             }
         }
-        return MLXArray(logits, [seqLen, vocabSize], dtype: DType.float32)
+        let data = Data(bytes: logits, count: logits.count * MemoryLayout<Float>.stride)
+        return MLXArray(data, [seqLen, vocabSize], dtype: DType.float32)
     }
 }
 
@@ -316,7 +327,7 @@ struct PagedAttentionServer {
 
         if CommandLine.arguments.contains("--dummy") {
             let layerSpec = PagedLayerSpec(headDim: 64, numHeads: 8, numKVHeads: 2, blockSize: 16, dataType: .float16)
-            adapter = DummyModelAdapter(layerSpec: layerSpec, vocabSize: 1000, hiddenSize: 512)
+            adapter = try DummyModelAdapter(layerSpec: layerSpec, vocabSize: 1000, hiddenSize: 512)
             tokenizer = PassthroughTokenizer()
             print("Using dummy model adapter (--dummy mode)")
         } else {

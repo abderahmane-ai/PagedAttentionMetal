@@ -82,7 +82,7 @@ import Metal
 
         let cpuOutput = cpuAttention(q: q, k: k, v: v, seqLen: seqLen, headDim: headDim, causal: false)
 
-        let cacheManager = KVCacheManager(device: device, maxBlocks: 4, blockSize: blockSize, headDim: headDim, numKVHeads: numKVHeads, dataType: .float32)
+        let cacheManager = try KVCacheManager(device: device, maxBlocks: 4, blockSize: blockSize, headDim: headDim, numKVHeads: numKVHeads, dataType: .float32)
         try cacheManager.allocateSequence(id: 1)
         try cacheManager.appendTokens(toSequence: 1, count: seqLen)
 
@@ -146,7 +146,7 @@ import Metal
                 }
             }
         }
-        let cache = KVCacheManager(device: device, maxBlocks: 8, blockSize: blockSize, headDim: headDim, numKVHeads: numKVHeads, dataType: .float16)
+        let cache = try KVCacheManager(device: device, maxBlocks: 8, blockSize: blockSize, headDim: headDim, numKVHeads: numKVHeads, dataType: .float16)
         try cache.allocateSequence(id: 1)
         try cache.appendTokens(toSequence: 1, count: seqLen)
         let kPtr = cache.kPoolBuffer.contents().bindMemory(to: Float16.self, capacity: seqLen * numKVHeads * headDim * 8)
@@ -177,7 +177,7 @@ import Metal
         #expect(maxErr < 0.1, "MMA output differs from CPU")
         print("  \u{2713} MMA correctness verified")
 
-        let cache32 = KVCacheManager(device: device, maxBlocks: 8, blockSize: blockSize, headDim: headDim, numKVHeads: numKVHeads, dataType: .float32)
+        let cache32 = try KVCacheManager(device: device, maxBlocks: 8, blockSize: blockSize, headDim: headDim, numKVHeads: numKVHeads, dataType: .float32)
         try cache32.allocateSequence(id: 2)
         try cache32.appendTokens(toSequence: 2, count: seqLen)
         let kPtr32 = cache32.kPoolBuffer.contents().bindMemory(to: Float.self, capacity: seqLen * numKVHeads * headDim * 8)
@@ -220,7 +220,7 @@ import Metal
 
         let cpuCausal = cpuAttention(q: q, k: k, v: v, seqLen: seqLen, headDim: headDim, causal: true)
 
-        let cacheManager = KVCacheManager(device: device, maxBlocks: 2, blockSize: blockSize, headDim: headDim, numKVHeads: numKVHeads, dataType: .float32)
+        let cacheManager = try KVCacheManager(device: device, maxBlocks: 2, blockSize: blockSize, headDim: headDim, numKVHeads: numKVHeads, dataType: .float32)
         try cacheManager.allocateSequence(id: 1)
         try cacheManager.appendTokens(toSequence: 1, count: seqLen)
 
@@ -263,7 +263,7 @@ import Metal
         let numKVHeads = 2
         let blockSize = 16
 
-        let cacheManager = KVCacheManager(device: device, maxBlocks: 4, blockSize: blockSize, headDim: headDim, numKVHeads: numKVHeads, dataType: .float32)
+        let cacheManager = try KVCacheManager(device: device, maxBlocks: 4, blockSize: blockSize, headDim: headDim, numKVHeads: numKVHeads, dataType: .float32)
         try cacheManager.allocateSequence(id: 1)
         try cacheManager.appendTokens(toSequence: 1, count: seqLen)
 
@@ -318,7 +318,7 @@ import Metal
         let k = (0..<(seqLen * numKVHeads * headDim)).map { _ in Float.random(in: -1...1) }
         let v = (0..<(seqLen * numKVHeads * headDim)).map { _ in Float.random(in: -1...1) }
 
-        let cache32 = KVCacheManager(device: device, maxBlocks: 64, blockSize: blockSize, headDim: headDim, numKVHeads: numKVHeads, dataType: .float32)
+        let cache32 = try KVCacheManager(device: device, maxBlocks: 64, blockSize: blockSize, headDim: headDim, numKVHeads: numKVHeads, dataType: .float32)
         try cache32.allocateSequence(id: 1)
         try cache32.appendTokens(toSequence: 1, count: seqLen)
 
@@ -349,7 +349,7 @@ import Metal
         let time32 = Date().timeIntervalSince(start32) * 1000 / Double(iterations)
         let output32 = readFloats(from: bufO32, count: seqLen * numHeads * headDim)
 
-        let cache16 = KVCacheManager(device: device, maxBlocks: 64, blockSize: blockSize, headDim: headDim, numKVHeads: numKVHeads, dataType: .float16)
+        let cache16 = try KVCacheManager(device: device, maxBlocks: 64, blockSize: blockSize, headDim: headDim, numKVHeads: numKVHeads, dataType: .float16)
         try cache16.allocateSequence(id: 1)
         try cache16.appendTokens(toSequence: 1, count: seqLen)
 
@@ -407,7 +407,7 @@ import Metal
         let blockSize = 16
         let seqLengths = [32, 48, 64, 80]
 
-        let batchCache = BatchKVCacheManager(device: device, maxBatchSize: batchSize, maxSequenceBlocks: 16, maxBlocks: 64, blockSize: blockSize, headDim: headDim, numKVHeads: numKVHeads, dataType: .float32)
+        let batchCache = try BatchKVCacheManager(device: device, maxBatchSize: batchSize, maxSequenceBlocks: 16, maxBlocks: 64, blockSize: blockSize, headDim: headDim, numKVHeads: numKVHeads, dataType: .float32)
 
         let batchIDs = Array(0..<batchSize)
         for i in 0..<batchSize {
@@ -449,7 +449,7 @@ import Metal
         var outputs: [[Float]] = []
 
         for blockSize in blockSizes {
-            let cache = KVCacheManager(device: device, maxBlocks: 8, blockSize: blockSize, headDim: headDim, numKVHeads: numKVHeads, dataType: .float32)
+            let cache = try KVCacheManager(device: device, maxBlocks: 8, blockSize: blockSize, headDim: headDim, numKVHeads: numKVHeads, dataType: .float32)
             try cache.allocateSequence(id: 1)
             try cache.appendTokens(toSequence: 1, count: seqLen)
 
@@ -491,7 +491,7 @@ import Metal
         let seqLen = 8
         let headDim = 32
         let layer = PagedLayerSpec(headDim: headDim, numHeads: 1, numKVHeads: 1, blockSize: 8, dataType: .float32)
-        let cache = KVCacheManager(device: device, maxBlocks: 4, blockSize: layer.blockSize, headDim: headDim, numKVHeads: 1, dataType: .float32)
+        let cache = try KVCacheManager(device: device, maxBlocks: 4, blockSize: layer.blockSize, headDim: headDim, numKVHeads: 1, dataType: .float32)
         try cache.allocateSequence(id: 1)
         try cache.appendTokens(toSequence: 1, count: seqLen)
 
@@ -527,7 +527,7 @@ import Metal
             layer: layer,
             causal: true
         ))
-        #expect(engine.lastStats.operation == .prefillSinglePass)
+        #expect(engine.lastStats.operation == .prefillFlash)
         #expect(engine.lastStats.sequenceLength == seqLen)
     }
 
@@ -535,7 +535,7 @@ import Metal
     @Test func prefillFallsBackToSplitWhenSinglePassThreadgroupIsTooLarge() throws {
         let seqLen = 32
         let layer = PagedLayerSpec(headDim: 256, numHeads: 8, numKVHeads: 2, blockSize: 16, dataType: .float32)
-        let cache = KVCacheManager(
+        let cache = try KVCacheManager(
             device: device,
             maxBlocks: 8,
             blockSize: layer.blockSize,
@@ -634,7 +634,7 @@ import Metal
         let k = (0..<(seqLen * numKVHeads * headDim)).map { _ in Float.random(in: -1...1) }
         let v = (0..<(seqLen * numKVHeads * headDim)).map { _ in Float.random(in: -1...1) }
 
-        let cache16 = KVCacheManager(device: device, maxBlocks: numBlocks, blockSize: blockSize,
+        let cache16 = try KVCacheManager(device: device, maxBlocks: numBlocks, blockSize: blockSize,
                                       headDim: headDim, numKVHeads: numKVHeads, dataType: .float16)
         try cache16.allocateSequence(id: 1)
         try cache16.appendTokens(toSequence: 1, count: seqLen)
@@ -713,7 +713,7 @@ import Metal
 
 
     @Test func emptySequencePrefill() throws {
-        let cache = KVCacheManager(device: device, maxBlocks: 4, blockSize: 16, headDim: 32, numKVHeads: 1, dataType: .float32)
+        let cache = try KVCacheManager(device: device, maxBlocks: 4, blockSize: 16, headDim: 32, numKVHeads: 1, dataType: .float32)
         try cache.allocateSequence(id: 1)
         try cache.appendTokens(toSequence: 1, count: 8)
 
@@ -734,7 +734,7 @@ import Metal
     }
 
     @Test func prefillWithZeroBlocks() throws {
-        let cache = KVCacheManager(device: device, maxBlocks: 1, blockSize: 16, headDim: 32, numKVHeads: 1, dataType: .float32)
+        let cache = try KVCacheManager(device: device, maxBlocks: 1, blockSize: 16, headDim: 32, numKVHeads: 1, dataType: .float32)
 
         #expect(cache.availableBlocks == 1)
 
@@ -753,7 +753,7 @@ import Metal
     }
 
     @Test func allocateThenImmediateFree() throws {
-        let cache = KVCacheManager(device: device, maxBlocks: 4, blockSize: 16, headDim: 32, numKVHeads: 1, dataType: .float32)
+        let cache = try KVCacheManager(device: device, maxBlocks: 4, blockSize: 16, headDim: 32, numKVHeads: 1, dataType: .float32)
 
         #expect(cache.availableBlocks == 4)
 
@@ -793,7 +793,7 @@ import Metal
 
     @Test func appendBeyondBlockBoundary() throws {
         let blockSize = 16
-        let cache = KVCacheManager(device: device, maxBlocks: 16, blockSize: blockSize, headDim: 32, numKVHeads: 1, dataType: .float32)
+        let cache = try KVCacheManager(device: device, maxBlocks: 16, blockSize: blockSize, headDim: 32, numKVHeads: 1, dataType: .float32)
         try cache.allocateSequence(id: 1)
 
         try cache.appendTokens(toSequence: 1, count: blockSize * 3 + 7)
@@ -814,7 +814,7 @@ import Metal
         let numKVHeads = 1
         let blockSize = 16
 
-        let cache = KVCacheManager(device: device, maxBlocks: 16, blockSize: blockSize, headDim: headDim, numKVHeads: numKVHeads, dataType: .float32)
+        let cache = try KVCacheManager(device: device, maxBlocks: 16, blockSize: blockSize, headDim: headDim, numKVHeads: numKVHeads, dataType: .float32)
         try cache.allocateSequence(id: 1)
 
         var totalTokens = 0
@@ -877,7 +877,7 @@ import Metal
         let numKVHeads = 1
         let blockSize = 16
 
-        let cache = KVCacheManager(device: device, maxBlocks: 16, blockSize: blockSize, headDim: headDim,
+        let cache = try KVCacheManager(device: device, maxBlocks: 16, blockSize: blockSize, headDim: headDim,
                                     numKVHeads: numKVHeads, dataType: .float32)
         try cache.allocateSequence(id: 1)
         try cache.appendTokens(toSequence: 1, count: 16)
@@ -947,7 +947,7 @@ import Metal
             }
         }
 
-        let cacheFused = KVCacheManager(device: device, maxBlocks: numBlocks, blockSize: blockSize,
+        let cacheFused = try KVCacheManager(device: device, maxBlocks: numBlocks, blockSize: blockSize,
                                          headDim: headDim, numKVHeads: numKVHeads, dataType: .float32)
         try cacheFused.allocateSequence(id: 1)
         try cacheFused.appendTokens(toSequence: 1, count: seqLen)
@@ -975,7 +975,7 @@ import Metal
 
         let outputFused = readFloats(from: bufOFused, count: seqLen * numHeads * headDim)
 
-        let cacheSep = KVCacheManager(device: device, maxBlocks: numBlocks, blockSize: blockSize,
+        let cacheSep = try KVCacheManager(device: device, maxBlocks: numBlocks, blockSize: blockSize,
                                        headDim: headDim, numKVHeads: numKVHeads, dataType: .float32)
         try cacheSep.allocateSequence(id: 1)
         try cacheSep.appendTokens(toSequence: 1, count: seqLen)
@@ -1044,7 +1044,7 @@ import Metal
         let numKVHeads = 1
         let blockSize = 16
 
-        let cache = KVCacheManager(device: device, maxBlocks: 4, blockSize: blockSize, headDim: headDim, numKVHeads: numKVHeads, dataType: .float32)
+        let cache = try KVCacheManager(device: device, maxBlocks: 4, blockSize: blockSize, headDim: headDim, numKVHeads: numKVHeads, dataType: .float32)
         try cache.allocateSequence(id: 1)
         try cache.appendTokens(toSequence: 1, count: seqLen)
 

@@ -115,7 +115,7 @@ public func pam_create_cache(
         guard maxBlocks > 0 else {
             throw PagedAttentionError.invalidConfiguration("maxBlocks must be positive")
         }
-        let cache = KVCacheManager(
+        let cache = try KVCacheManager(
             device: device,
             maxBlocks: Int(maxBlocks),
             blockSize: Int(blockSize),
@@ -356,6 +356,10 @@ private struct BatchKVCacheView {
             let offset = batchIndex * maxNumBlocks
             for (blockIndex, physicalBlock) in sequence.blockTable.enumerated() {
                 btPtr[offset + blockIndex] = physicalBlock
+            }
+            // Zero-fill padding slots to prevent out-of-bounds GPU reads
+            for blockIndex in sequence.blockTable.count..<maxNumBlocks {
+                btPtr[offset + blockIndex] = 0
             }
         }
 

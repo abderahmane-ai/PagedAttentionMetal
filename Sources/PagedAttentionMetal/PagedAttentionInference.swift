@@ -49,7 +49,7 @@ public final class PagedAttentionInference: @unchecked Sendable {
 
         let maxSequenceBlocks = maxBlocks
 
-        self.cache = BatchKVCacheManager(
+        self.cache = try BatchKVCacheManager(
             device: device,
             maxBatchSize: maxBatchSize,
             maxSequenceBlocks: maxSequenceBlocks,
@@ -239,22 +239,24 @@ public final class PagedAttentionInference: @unchecked Sendable {
     }
 
     private func ensureBlocksAvailable(_ needed: Int) throws {
-        guard cache.availableBlocks < needed else { return }
-
-        let preempted = scheduler.handleMemoryPressure(
-            requiredBlocks: needed,
-            availableBlocks: cache.availableBlocks
-        )
-
-        for pid in preempted {
-            cache.freeSequence(id: pid)
-            os_unfair_lock_lock(lock)
-            prefilledSequences.remove(pid)
-            os_unfair_lock_unlock(lock)
-        }
-
         guard cache.availableBlocks >= needed else {
-            throw KVCacheError.outOfMemory
+            // Not enough blocks, try to preempt
+            let preempted = scheduler.handleMemoryPressure(
+                requiredBlocks: needed,
+                availableBlocks: cache.availableBlocks
+            )
+
+            for pid in preempted {
+                cache.freeSequence(id: pid)
+                os_unfair_lock_lock(lock)
+                prefilledSequences.remove(pid)
+                os_unfair_lock_unlock(lock)
+            }
+
+            guard cache.availableBlocks >= needed else {
+                throw KVCacheError.outOfMemory
+            }
+            return
         }
     }
 }

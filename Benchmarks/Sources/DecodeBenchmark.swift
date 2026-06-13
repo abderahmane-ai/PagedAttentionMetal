@@ -121,7 +121,7 @@ struct DecodeBenchmark {
 
     func runSingleDecode(config: BenchmarkConfig, name: String = "Decode") throws -> BenchmarkResult {
         let maxNumBlocks = (config.seqLen + config.blockSize - 1) / config.blockSize
-        let batchManager = BatchKVCacheManager(
+        let batchManager = try BatchKVCacheManager(
             device: device,
             maxBatchSize: config.batchSize,
             maxSequenceBlocks: maxNumBlocks,

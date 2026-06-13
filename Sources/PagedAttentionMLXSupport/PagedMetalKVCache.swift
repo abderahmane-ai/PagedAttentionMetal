@@ -50,7 +50,7 @@ public final class PagedMetalKVCache: KVCache, CustomDebugStringConvertible {
         self.engine = try engine ?? PagedAttentionEngine()
         self.sequenceID = sequenceID
         self.layer = layer
-        self.cacheManager = KVCacheManager(
+        self.cacheManager = try KVCacheManager(
             device: device,
             maxBlocks: maxBlocks,
             blockSize: layer.blockSize,
@@ -121,8 +121,8 @@ public final class PagedMetalKVCache: KVCache, CustomDebugStringConvertible {
         if seqLen == 1 {
             let batchTable = try batchBlockTableBuffer()
             let seqLengths = [UInt32(offset)]
-            guard let seqLengthBuffer = seqLengths.withUnsafeBytes({
-                device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared)
+            guard let seqLengthBuffer = seqLengths.withUnsafeBytes({ (ptr: UnsafeRawBufferPointer) in
+                device.makeBuffer(bytes: ptr.baseAddress!, length: ptr.count, options: .storageModeShared)
             }) else {
                 throw PagedAttentionMLXError.bufferCreationFailed("sequence lengths")
             }
@@ -186,7 +186,7 @@ public final class PagedMetalKVCache: KVCache, CustomDebugStringConvertible {
             return .none
         }
         if returnArray || (windowSize != nil && n > windowSize!) {
-            return .array(createCausalMask(n: n, offset: offset, windowSize: windowSize))
+            return .array(MLXLMCommon.createCausalMask(n: n, offset: offset, windowSize: windowSize))
         }
         return .causal
     }
@@ -224,8 +224,16 @@ public final class PagedMetalKVCache: KVCache, CustomDebugStringConvertible {
     private func batchBlockTableBuffer() throws -> MTLBuffer {
         let sequence = try cacheManager.getSequence(id: sequenceID)
         let table = sequence.blockTable.isEmpty ? [Int32(0)] : sequence.blockTable
-        guard let buffer = table.withUnsafeBytes({
-            device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared)
+        let maxBlocks = max(1, try cacheManager.getNumBlocks(forSequence: sequenceID))
+        
+        // Pad table to maxBlocks
+        var paddedTable = table
+        if paddedTable.count < maxBlocks {
+            paddedTable.append(contentsOf: Array(repeating: Int32(0), count: maxBlocks - paddedTable.count))
+        }
+        
+        guard let buffer = paddedTable.withUnsafeBytes({ (ptr: UnsafeRawBufferPointer) in
+            device.makeBuffer(bytes: ptr.baseAddress!, length: ptr.count, options: .storageModeShared)
         }) else {
             throw PagedAttentionMLXError.bufferCreationFailed("block table")
         }
@@ -246,7 +254,7 @@ public func pagedAttentionWithCacheUpdate(
        let output = try? cache.pagedAttention(queries: queries, keys: keys, values: values, mask: mask) {
         return output
     }
-    return attentionWithCacheUpdate(
+    return MLXLMCommon.attentionWithCacheUpdate(
         queries: queries,
         keys: keys,
         values: values,

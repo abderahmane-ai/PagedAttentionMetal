@@ -81,7 +81,7 @@ struct MemoryBenchmark {
     private func runPrefixCacheSavings(results: inout ResultsTable) throws {
         var progress = ProgressBar(total: 3)
 
-        let cacheManager1 = KVCacheManager(
+        let cacheManager1 = try KVCacheManager(
             device: device,
             maxBlocks: 1024,
             blockSize: 16,
@@ -102,7 +102,7 @@ struct MemoryBenchmark {
         progress.increment("no prefix cache")
 
         let prefixBlocks = 32
-        let cacheManager2 = KVCacheManager(
+        let cacheManager2 = try KVCacheManager(
             device: device,
             maxBlocks: 1024,
             blockSize: 16,
@@ -152,7 +152,7 @@ struct MemoryBenchmark {
         let totalBlocks = numSequences * blocksPerSeq
         let maxBlocks = Int(Double(totalBlocks) * 1.2)
 
-        let cacheManager = KVCacheManager(
+        let cacheManager = try KVCacheManager(
             device: device,
             maxBlocks: max(maxBlocks, 1),
             blockSize: blockSize,
@@ -198,7 +198,7 @@ func runFP8MemoryComparison() throws {
         let maxBlocks = Int(Double(totalBlocks) * 1.2)
 
         for dataType in [PagedAttentionDataType.float16, PagedAttentionDataType.float8] {
-            let cache = KVCacheManager(
+            let cache = try KVCacheManager(
                 device: device,
                 maxBlocks: max(maxBlocks, 1),
                 blockSize: blockSize,

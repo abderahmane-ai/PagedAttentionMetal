@@ -9,6 +9,9 @@ private final class CommandBufferManager: @unchecked Sendable {
     private let prepareQueue: DispatchQueue
     private var _prepared: MTLCommandBuffer?
     private let lock: UnsafeMutablePointer<os_unfair_lock>
+    private var _pendingCount = 0
+    private let pendingLock = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
+    private let waitSemaphore = DispatchSemaphore(value: 0)
 
     init(queue: MTLCommandQueue, count: Int = 3) {
         self.commandQueue = queue
@@ -16,12 +19,15 @@ private final class CommandBufferManager: @unchecked Sendable {
         self.prepareQueue = DispatchQueue(label: "com.pagedattentionmetal.cmdprep", qos: .userInitiated)
         self._prepared = queue.makeCommandBuffer()
         self.lock = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
+        self.pendingLock.initialize(to: os_unfair_lock())
         lock.pointee = os_unfair_lock()
     }
 
     deinit {
         lock.deinitialize(count: 1)
         lock.deallocate()
+        pendingLock.deinitialize(count: 1)
+        pendingLock.deallocate()
     }
 
     private var prepared: MTLCommandBuffer? {
@@ -31,6 +37,9 @@ private final class CommandBufferManager: @unchecked Sendable {
 
     func next() -> MTLCommandBuffer {
         semaphore.wait()
+        os_unfair_lock_lock(pendingLock)
+        _pendingCount += 1
+        os_unfair_lock_unlock(pendingLock)
         let cb: MTLCommandBuffer
         if let p = prepared {
             prepared = nil
@@ -42,8 +51,29 @@ private final class CommandBufferManager: @unchecked Sendable {
             guard let self = self else { return }
             self.prepared = self.commandQueue.makeCommandBuffer()
         }
-        cb.addCompletedHandler { [semaphore] _ in semaphore.signal() }
+        cb.addCompletedHandler { [weak self, semaphore] _ in
+            if let self {
+                os_unfair_lock_lock(self.pendingLock)
+                self._pendingCount -= 1
+                let shouldSignal = self._pendingCount == 0
+                os_unfair_lock_unlock(self.pendingLock)
+                if shouldSignal {
+                    self.waitSemaphore.signal()
+                }
+            }
+            semaphore.signal()
+        }
         return cb
+    }
+
+    func waitForAll() {
+        while true {
+            os_unfair_lock_lock(pendingLock)
+            let count = _pendingCount
+            os_unfair_lock_unlock(pendingLock)
+            if count == 0 { break }
+            waitSemaphore.wait()
+        }
     }
 }
 
@@ -107,24 +137,35 @@ public class PagedAttentionEngine: @unchecked Sendable {
     }
 
     public static var defaultLibrary: MTLLibrary {
-        if let url = Bundle.module.url(forResource: "kernels", withExtension: "metal"),
-           let source = try? String(contentsOf: url),
-           let device = MTLCreateSystemDefaultDevice(),
-           let library = try? device.makeLibrary(source: source, options: nil) {
-            return library
+        get throws {
+            if let url = Bundle.module.url(forResource: "kernels", withExtension: "metallib"),
+               let device = MTLCreateSystemDefaultDevice(),
+               let library = try? device.makeLibrary(URL: url) {
+                return library
+            }
+            if let url = Bundle.module.url(forResource: "kernels", withExtension: "metal"),
+               let source = try? String(contentsOf: url),
+               let device = MTLCreateSystemDefaultDevice(),
+               let library = try? device.makeLibrary(source: source, options: nil) {
+                return library
+            }
+            let sourcePath = #filePath.replacingOccurrences(of: "PagedAttentionEngine.swift", with: "kernels.metal")
+            if let source = try? String(contentsOfFile: sourcePath),
+               let device = MTLCreateSystemDefaultDevice(),
+               let library = try? device.makeLibrary(source: source, options: nil) {
+                return library
+            }
+            throw PagedAttentionError.libraryInitializationFailed("kernels.metal not found in bundle or source directory")
         }
-
-        let sourcePath = #filePath.replacingOccurrences(of: "PagedAttentionEngine.swift", with: "kernels.metal")
-        if let source = try? String(contentsOfFile: sourcePath),
-           let device = MTLCreateSystemDefaultDevice(),
-           let library = try? device.makeLibrary(source: source, options: nil) {
-            return library
-        }
-
-        fatalError("kernels.metal not found in bundle or source directory")
     }
 
     public static func makeDefaultLibrary(device: MTLDevice) throws -> MTLLibrary {
+        // Try precompiled .metallib first (faster startup)
+        if let url = Bundle.module.url(forResource: "kernels", withExtension: "metallib"),
+           let library = try? device.makeLibrary(URL: url) {
+            return library
+        }
+        // Fallback to source compilation
         if let url = Bundle.module.url(forResource: "kernels", withExtension: "metal") {
             do {
                 let source = try String(contentsOf: url)
@@ -310,6 +351,10 @@ public class PagedAttentionEngine: @unchecked Sendable {
         os_log(.error, log: Self.log, "%{public}s", message)
     }
 
+    /// Retries a synchronous block operation with exponential backoff.
+    /// NOTE: This function uses `usleep` for backoff which blocks the OS thread.
+    /// It must only be called from synchronous (non-async) contexts.
+    /// Calling from an async Task context will block the cooperative thread pool.
     private func withRetry<T>(operation: String, block: () throws -> T) throws -> T {
         var lastError: Error?
         for attempt in 0..<maxRetries {
@@ -330,7 +375,7 @@ public class PagedAttentionEngine: @unchecked Sendable {
                 }
                 lock.unlock()
                 if attempt > 0 {
-                    Thread.sleep(forTimeInterval: 0.01 * Double(1 << attempt))
+                    usleep(UInt32(0.01 * Double(1 << attempt) * 1_000_000))
                 }
             }
         }
@@ -445,7 +490,10 @@ public class PagedAttentionEngine: @unchecked Sendable {
 
         let numBlocks = logicalBlocks(tokenCount: request.seqLen, blockSize: request.layer.blockSize)
         lock.lock()
-        let opName: PagedAttentionStats.Operation = useMMA ? .prefillSinglePass : (useFlash ? .prefillSinglePass : (useTiledPass ? .prefillTiledPass : .prefillSinglePass))
+        let opName: PagedAttentionStats.Operation = 
+            useMMA ? .prefillMMA :
+            useFlash ? .prefillFlash :
+            useTiledPass ? .prefillTiledPass : .prefillSinglePass
         _lastStats = PagedAttentionStats(
             operation: opName,
             batchSize: 1,
@@ -730,8 +778,10 @@ public class PagedAttentionEngine: @unchecked Sendable {
         enc.setBytes(&blockSizeVar, length: 4, index: 9)
         enc.setBytes(&causalVar, length: 4, index: 10)
 
-        let mBuffer = device.makeBuffer(length: seqLen * numHeads * MemoryLayout<Float>.stride, options: .storageModePrivate)!
-        let lBuffer = device.makeBuffer(length: seqLen * numHeads * MemoryLayout<Float>.stride, options: .storageModePrivate)!
+        guard let mBuffer = device.makeBuffer(length: seqLen * numHeads * MemoryLayout<Float>.stride, options: .storageModePrivate),
+              let lBuffer = device.makeBuffer(length: seqLen * numHeads * MemoryLayout<Float>.stride, options: .storageModePrivate) else {
+            throw PagedAttentionError.commandEncodingFailed("Failed to allocate M/L buffers")
+        }
         enc.setBuffer(mBuffer, offset: 0, index: 11)
         enc.setBuffer(lBuffer, offset: 0, index: 12)
         enc.setBytes(&windowStartVar, length: 4, index: 13)
@@ -1090,6 +1140,7 @@ public class PagedAttentionEngine: @unchecked Sendable {
         blockTable: MTLBuffer,
         tokenOffset: Int,
         numNewTokens: Int,
+        numHeads: Int,
         numKVHeads: Int,
         headDim: Int,
         blockSize: Int,
@@ -1099,7 +1150,7 @@ public class PagedAttentionEngine: @unchecked Sendable {
         let effectiveWindowSize = windowSize > 0 ? windowSize : defaultWindowSize
         let layer = PagedLayerSpec(
             headDim: headDim,
-            numHeads: numKVHeads,
+            numHeads: numHeads,
             numKVHeads: numKVHeads,
             blockSize: blockSize,
             dataType: dataType,
@@ -1360,11 +1411,11 @@ public class PagedAttentionEngine: @unchecked Sendable {
             throw PagedAttentionError.invalidConfiguration("buffer/layer count mismatch")
         }
 
-        var lastCB: MTLCommandBuffer?
+        var commandBuffers: [MTLCommandBuffer] = []
 
         for i in 0..<layers.count {
             let cb = cmdBufManager.next()
-            lastCB = cb
+            commandBuffers.append(cb)
             guard let enc = cb.makeComputeCommandEncoder() else {
                 throw PagedAttentionError.commandEncodingFailed("failed to create encoder for layer \(i)")
             }
@@ -1453,8 +1504,7 @@ public class PagedAttentionEngine: @unchecked Sendable {
                 let threadgroups = MTLSize(width: numKVHeads, height: numQTiles, depth: 1)
                 enc.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerTG)
             } else {
-                let shouldUseTiled = (blockSize * headDim * MemoryLayout<Float>.stride * 3) > device.maxThreadgroupMemoryLength ||
-                    (headDim * blockSize) > singlePassPipeline.maxTotalThreadsPerThreadgroup
+                let shouldUseTiled = shouldUseTiledPass(seqLen: seqLen, layer: layer)
 
                 let pipeline: MTLComputePipelineState
                 if shouldUseTiled {
@@ -1517,8 +1567,10 @@ public class PagedAttentionEngine: @unchecked Sendable {
                     enc.setBytes(&blockSizeVar, length: 4, index: 9)
                     enc.setBytes(&causalVar, length: 4, index: 10)
 
-                    let mBuffer = device.makeBuffer(length: seqLen * numHeads * MemoryLayout<Float>.stride, options: .storageModePrivate)!
-                    let lBuffer = device.makeBuffer(length: seqLen * numHeads * MemoryLayout<Float>.stride, options: .storageModePrivate)!
+                    guard let mBuffer = device.makeBuffer(length: seqLen * numHeads * MemoryLayout<Float>.stride, options: .storageModePrivate),
+                          let lBuffer = device.makeBuffer(length: seqLen * numHeads * MemoryLayout<Float>.stride, options: .storageModePrivate) else {
+                        throw PagedAttentionError.commandEncodingFailed("Failed to allocate M/L buffers")
+                    }
                     enc.setBuffer(mBuffer, offset: 0, index: 11)
                     enc.setBuffer(lBuffer, offset: 0, index: 12)
                     enc.setBytes(&windowStartVar, length: 4, index: 13)
@@ -1544,9 +1596,10 @@ public class PagedAttentionEngine: @unchecked Sendable {
             enc.endEncoding()
             cb.commit()
         }
-
-        if let last = lastCB, last.status == .error {
-            throw PagedAttentionError.commandExecutionFailed(last.error?.localizedDescription ?? "Metal error in prefillLayers")
+        // Wait for all command buffers to complete before checking errors
+        cmdBufManager.waitForAll()
+        for cb in commandBuffers where cb.status == .error {
+            throw PagedAttentionError.commandExecutionFailed(cb.error?.localizedDescription ?? "Metal error in prefillLayers")
         }
     }
 
@@ -1566,11 +1619,11 @@ public class PagedAttentionEngine: @unchecked Sendable {
             throw PagedAttentionError.invalidConfiguration("buffer/layer count mismatch")
         }
 
-        var lastCB: MTLCommandBuffer?
+        var commandBuffers: [MTLCommandBuffer] = []
 
         for i in 0..<layers.count {
             let cb = cmdBufManager.next()
-            lastCB = cb
+            commandBuffers.append(cb)
             guard let enc = cb.makeComputeCommandEncoder() else {
                 throw PagedAttentionError.commandEncodingFailed("failed to create decode encoder for layer \(i)")
             }
@@ -1645,9 +1698,10 @@ public class PagedAttentionEngine: @unchecked Sendable {
             enc.endEncoding()
             cb.commit()
         }
-
-        if let last = lastCB, last.status == .error {
-            throw PagedAttentionError.commandExecutionFailed(last.error?.localizedDescription ?? "Metal error in decodeLayers")
+        // Wait for all command buffers to complete before checking errors
+        cmdBufManager.waitForAll()
+        for cb in commandBuffers where cb.status == .error {
+            throw PagedAttentionError.commandExecutionFailed(cb.error?.localizedDescription ?? "Metal error in decodeLayers")
         }
     }
 
@@ -1659,56 +1713,148 @@ public class PagedAttentionEngine: @unchecked Sendable {
         blockTable: MTLBuffer,
         tokenOffset: Int,
         numNewTokens: Int,
-        layers: [PagedLayerSpec]
+        layers: [PagedLayerSpec],
+        kScaleBuffers: [MTLBuffer]? = nil,
+        vScaleBuffers: [MTLBuffer]? = nil
     ) throws {
         guard keys.count == layers.count && values.count == layers.count else {
             throw PagedAttentionError.invalidConfiguration("buffer/layer count mismatch")
         }
+        if let kScaleBuffers {
+            guard kScaleBuffers.count == layers.count else {
+                throw PagedAttentionError.invalidConfiguration("kScaleBuffers count must match layers count")
+            }
+        }
+        if let vScaleBuffers {
+            guard vScaleBuffers.count == layers.count else {
+                throw PagedAttentionError.invalidConfiguration("vScaleBuffers count must match layers count")
+            }
+        }
 
-        var lastCB: MTLCommandBuffer?
+        var commandBuffers: [MTLCommandBuffer] = []
 
         for i in 0..<layers.count {
-            let cb = cmdBufManager.next()
-            lastCB = cb
-            guard let enc = cb.makeComputeCommandEncoder() else {
-                throw PagedAttentionError.commandEncodingFailed("failed to create append encoder for layer \(i)")
-            }
-
             let layer = layers[i]
             let dataType = layer.dataType
             let headDim = layer.headDim
             let numKVHeads = layer.numKVHeads
             let blockSize = layer.blockSize
 
-            let pipeline = (dataType == .float16) ? appendPipelineF16 : appendPipeline
-            enc.setComputePipelineState(pipeline)
-            enc.setBuffer(keys[i], offset: 0, index: 0)
-            enc.setBuffer(values[i], offset: 0, index: 1)
-            enc.setBuffer(kPool, offset: 0, index: 2)
-            enc.setBuffer(vPool, offset: 0, index: 3)
-            enc.setBuffer(blockTable, offset: 0, index: 4)
+            if dataType == .float8 {
+                let bytesPerBlock = blockSize * numKVHeads * headDim
+                let maxBlocks = kPool.length / bytesPerBlock
+                let scratchSize = maxBlocks * 2 * MemoryLayout<Float>.stride
+                guard let scratchBuffer = device.makeBuffer(length: scratchSize, options: .storageModeShared) else {
+                    throw PagedAttentionError.commandEncodingFailed("failed to create FP8 scratch buffer")
+                }
+                scratchBuffer.contents().bindMemory(to: Float.self, capacity: maxBlocks * 2).update(repeating: 0, count: maxBlocks * 2)
 
-            var tokenOffsetVar = UInt32(tokenOffset)
-            var numNewTokensVar = UInt32(numNewTokens)
-            var numKVHeadsVar = UInt32(numKVHeads)
-            var headDimVar = UInt32(headDim)
-            var blockSizeVar = UInt32(blockSize)
+                // First pass: compute scales
+                let cb1 = cmdBufManager.next()
+                commandBuffers.append(cb1)
+                guard let enc1 = cb1.makeComputeCommandEncoder() else {
+                    throw PagedAttentionError.commandEncodingFailed("failed to create FP8 scale command buffer or encoder")
+                }
+                enc1.setComputePipelineState(appendScaleFP8)
+                enc1.setBuffer(keys[i], offset: 0, index: 0)
+                enc1.setBuffer(values[i], offset: 0, index: 1)
+                enc1.setBuffer(blockTable, offset: 0, index: 2)
 
-            enc.setBytes(&tokenOffsetVar, length: 4, index: 5)
-            enc.setBytes(&numNewTokensVar, length: 4, index: 6)
-            enc.setBytes(&numKVHeadsVar, length: 4, index: 7)
-            enc.setBytes(&headDimVar, length: 4, index: 8)
-            enc.setBytes(&blockSizeVar, length: 4, index: 9)
+                var tokenOffsetVar1 = UInt32(tokenOffset)
+                var numNewTokensVar1 = UInt32(numNewTokens)
+                var numKVHeadsVar1 = UInt32(numKVHeads)
+                var headDimVar1 = UInt32(headDim)
+                var blockSizeVar1 = UInt32(blockSize)
 
-            let grid = MTLSize(width: headDim, height: numKVHeads, depth: numNewTokens)
-            let tgroup = MTLSize(width: min(headDim, 32), height: 1, depth: 1)
-            enc.dispatchThreads(grid, threadsPerThreadgroup: tgroup)
-            enc.endEncoding()
-            cb.commit()
+                enc1.setBytes(&tokenOffsetVar1, length: 4, index: 3)
+                enc1.setBytes(&numNewTokensVar1, length: 4, index: 4)
+                enc1.setBytes(&numKVHeadsVar1, length: 4, index: 5)
+                enc1.setBytes(&headDimVar1, length: 4, index: 6)
+                enc1.setBytes(&blockSizeVar1, length: 4, index: 7)
+                enc1.setBuffer(scratchBuffer, offset: 0, index: 8)
+
+                let grid1 = MTLSize(width: headDim, height: numKVHeads, depth: numNewTokens)
+                let tgroup1 = MTLSize(width: min(headDim, 32), height: 1, depth: 1)
+                enc1.dispatchThreads(grid1, threadsPerThreadgroup: tgroup1)
+                enc1.endEncoding()
+                try commitAndWait(cb1)
+
+                // Second pass: append with scales
+                let cb2 = cmdBufManager.next()
+                commandBuffers.append(cb2)
+                guard let enc2 = cb2.makeComputeCommandEncoder() else {
+                    throw PagedAttentionError.commandEncodingFailed("failed to create FP8 append command buffer or encoder")
+                }
+                enc2.setComputePipelineState(appendPipelineFP8)
+                enc2.setBuffer(keys[i], offset: 0, index: 0)
+                enc2.setBuffer(values[i], offset: 0, index: 1)
+                enc2.setBuffer(kPool, offset: 0, index: 2)
+                enc2.setBuffer(vPool, offset: 0, index: 3)
+                enc2.setBuffer(blockTable, offset: 0, index: 4)
+
+                var tokenOffsetVar = UInt32(tokenOffset)
+                var numNewTokensVar = UInt32(numNewTokens)
+                var numKVHeadsVar = UInt32(numKVHeads)
+                var headDimVar = UInt32(headDim)
+                var blockSizeVar = UInt32(blockSize)
+
+                enc2.setBytes(&tokenOffsetVar, length: 4, index: 5)
+                enc2.setBytes(&numNewTokensVar, length: 4, index: 6)
+                enc2.setBytes(&numKVHeadsVar, length: 4, index: 7)
+                enc2.setBytes(&headDimVar, length: 4, index: 8)
+                enc2.setBytes(&blockSizeVar, length: 4, index: 9)
+                enc2.setBuffer(scratchBuffer, offset: 0, index: 10)
+                if let kScaleBuffers {
+                    enc2.setBuffer(kScaleBuffers[i], offset: 0, index: 11)
+                }
+                if let vScaleBuffers {
+                    enc2.setBuffer(vScaleBuffers[i], offset: 0, index: 12)
+                }
+
+                let grid2 = MTLSize(width: headDim, height: numKVHeads, depth: numNewTokens)
+                let tgroup2 = MTLSize(width: min(headDim, 32), height: 1, depth: 1)
+                enc2.dispatchThreads(grid2, threadsPerThreadgroup: tgroup2)
+                enc2.endEncoding()
+                cb2.commit()
+            } else {
+                let cb = cmdBufManager.next()
+                commandBuffers.append(cb)
+                guard let enc = cb.makeComputeCommandEncoder() else {
+                    throw PagedAttentionError.commandEncodingFailed("failed to create append encoder for layer \(i)")
+                }
+
+                let pipeline = (dataType == .float16) ? appendPipelineF16 : appendPipeline
+                enc.setComputePipelineState(pipeline)
+                enc.setBuffer(keys[i], offset: 0, index: 0)
+                enc.setBuffer(values[i], offset: 0, index: 1)
+                enc.setBuffer(kPool, offset: 0, index: 2)
+                enc.setBuffer(vPool, offset: 0, index: 3)
+                enc.setBuffer(blockTable, offset: 0, index: 4)
+
+                var tokenOffsetVar = UInt32(tokenOffset)
+                var numNewTokensVar = UInt32(numNewTokens)
+                var numKVHeadsVar = UInt32(numKVHeads)
+                var headDimVar = UInt32(headDim)
+                var blockSizeVar = UInt32(blockSize)
+
+                enc.setBytes(&tokenOffsetVar, length: 4, index: 5)
+                enc.setBytes(&numNewTokensVar, length: 4, index: 6)
+                enc.setBytes(&numKVHeadsVar, length: 4, index: 7)
+                enc.setBytes(&headDimVar, length: 4, index: 8)
+                enc.setBytes(&blockSizeVar, length: 4, index: 9)
+
+                let grid = MTLSize(width: headDim, height: numKVHeads, depth: numNewTokens)
+                let tgroup = MTLSize(width: min(headDim, 32), height: 1, depth: 1)
+                enc.dispatchThreads(grid, threadsPerThreadgroup: tgroup)
+                enc.endEncoding()
+                cb.commit()
+            }
         }
 
-        if let last = lastCB, last.status == .error {
-            throw PagedAttentionError.commandExecutionFailed(last.error?.localizedDescription ?? "Metal error in appendLayers")
+        // Wait for all command buffers to complete before checking errors
+        cmdBufManager.waitForAll()
+        for cb in commandBuffers where cb.status == .error {
+            throw PagedAttentionError.commandExecutionFailed(cb.error?.localizedDescription ?? "Metal error in appendLayers")
         }
     }
 
@@ -1725,7 +1871,7 @@ public class PagedAttentionEngine: @unchecked Sendable {
         try requireBuffer(request.vPool, name: "V pool", atLeast: poolBytesFor(blocks: numBlocks, layer: layer))
 
         if shouldUseTiledPass(seqLen: request.seqLen, layer: layer) {
-            try validateTiledPassDimensions()
+            try validateTiledPassDimensions(layer: layer)
         } else {
             try validateSinglePassDimensions(layer: layer)
         }
@@ -1791,7 +1937,22 @@ public class PagedAttentionEngine: @unchecked Sendable {
         }
     }
 
-    private func validateTiledPassDimensions() throws {
+    private func validateTiledPassDimensions(layer: PagedLayerSpec) throws {
+        let maxThreadgroupMemory = device.maxThreadgroupMemoryLength
+        let maxThreads = tiledPipeline.maxTotalThreadsPerThreadgroup
+        
+        // For tiled pass, we need to verify that tile size is feasible
+        // The tiled pass uses qTileSize * headDim * sizeof(Float) threadgroup memory
+        // and qTileSize * headDim threads per threadgroup
+        let maxTileFromMemory = maxThreadgroupMemory / (layer.headDim * MemoryLayout<Float>.stride)
+        let maxTileFromThreads = maxThreads / layer.headDim
+        let qTileSize = min(maxTileFromMemory, maxTileFromThreads, 32)
+        
+        guard qTileSize > 0 else {
+            throw PagedAttentionError.invalidConfiguration(
+                "tiled pass: headDim \(layer.headDim) exceeds device threadgroup memory/thread limits"
+            )
+        }
     }
 
     private func requireBuffer(_ buffer: MTLBuffer, name: String, atLeast expected: Int) throws {

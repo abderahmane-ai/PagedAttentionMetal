@@ -1,6 +1,7 @@
 import Foundation
 import Metal
 import os
+import Collections
 
 public enum KVCacheError: Error {
     case outOfMemory
@@ -57,7 +58,9 @@ public class KVCacheManager: @unchecked Sendable {
     public let kPoolBuffer: MTLBuffer
     public let vPoolBuffer: MTLBuffer
 
-    private var freeBlocks: [Int32]
+    private let lock = OSAllocatedUnfairLock()
+
+    private var freeBlocks: Deque<Int32>
     public var evictionPolicy: BlockEvictionPolicy = .fifo {
         didSet { rebuildFreeList() }
     }
@@ -76,7 +79,7 @@ public class KVCacheManager: @unchecked Sendable {
         headDim: Int,
         numKVHeads: Int,
         dataType: PagedAttentionDataType = .float16
-    ) {
+    ) throws {
         self.device = device
         self.maxBlocks = maxBlocks
         self.blockSize = blockSize
@@ -84,18 +87,24 @@ public class KVCacheManager: @unchecked Sendable {
         self.numKVHeads = numKVHeads
         self.dataType = dataType
 
-        let stride = (dataType == .float16) ? MemoryLayout<Float16>.stride : MemoryLayout<Float>.stride
+        let stride = dataType.byteWidth
         let poolBytes = maxBlocks * blockSize * numKVHeads * headDim * stride
 
-        self.kPoolBuffer = device.makeBuffer(length: poolBytes, options: .storageModeShared)!
-        self.vPoolBuffer = device.makeBuffer(length: poolBytes, options: .storageModeShared)!
+        guard let kPoolBuffer = device.makeBuffer(length: poolBytes, options: .storageModeShared),
+              let vPoolBuffer = device.makeBuffer(length: poolBytes, options: .storageModeShared) else {
+            throw PagedAttentionError.commandEncodingFailed("Failed to allocate KV pool buffers")
+        }
+        self.kPoolBuffer = kPoolBuffer
+        self.vPoolBuffer = vPoolBuffer
 
-        self.freeBlocks = (0..<Int32(maxBlocks)).reversed()
+        self.freeBlocks = Deque((0..<Int32(maxBlocks)).reversed())
         self.prefixCache = [:]
         self.blockRefCounts = [Int32](repeating: 0, count: maxBlocks)
     }
 
     public func allocateSequence(id: Int) throws {
+        lock.lock()
+        defer { lock.unlock() }
         guard sequences[id] == nil else {
             throw KVCacheError.sequenceAlreadyExists
         }
@@ -103,6 +112,8 @@ public class KVCacheManager: @unchecked Sendable {
     }
 
     public func appendTokens(toSequence id: Int, count: Int, blockHashes: [UInt64]? = nil) throws {
+        lock.lock()
+        defer { lock.unlock() }
         guard count >= 0 else {
             throw KVCacheError.invalidRequest("count must be non-negative")
         }
@@ -186,6 +197,8 @@ public class KVCacheManager: @unchecked Sendable {
     }
 
     public func ensureExclusiveAccess(sequenceId: Int, logicalBlockIndex: Int) throws {
+        lock.lock()
+        defer { lock.unlock() }
         guard var sequence = sequences[sequenceId] else {
             throw KVCacheError.sequenceNotFound
         }
@@ -200,6 +213,8 @@ public class KVCacheManager: @unchecked Sendable {
     }
 
     public func freeSequence(id: Int) {
+        lock.lock()
+        defer { lock.unlock() }
         if let sequence = sequences.removeValue(forKey: id) {
             let totalBlocks = sequence.blockTable.count
             let remainder = sequence.sequenceLength % blockSize
@@ -210,7 +225,7 @@ public class KVCacheManager: @unchecked Sendable {
                 if blockRefCounts[idx] <= 0 {
                     switch evictionPolicy {
                     case .fifo:
-                        freeBlocks.insert(blockId, at: 0)
+                        freeBlocks.prepend(blockId)
                     case .lifo:
                         freeBlocks.append(blockId)
                     case .bestFit:
@@ -251,10 +266,10 @@ public class KVCacheManager: @unchecked Sendable {
     private func rebuildFreeList() {
         switch evictionPolicy {
         case .fifo:
-            freeBlocks.reverse()
+            freeBlocks = Deque(freeBlocks.reversed())
             freeBlockSizes.removeAll(keepingCapacity: true)
         case .lifo:
-            freeBlocks.reverse()
+            freeBlocks = Deque(freeBlocks.reversed())
             freeBlockSizes.removeAll(keepingCapacity: true)
         case .bestFit:
             for blockId in freeBlocks {
@@ -262,19 +277,34 @@ public class KVCacheManager: @unchecked Sendable {
                     freeBlockSizes[blockId] = blockSize
                 }
             }
-            freeBlocks.sort { freeBlockSizes[$0, default: 0] > freeBlockSizes[$1, default: 0] }
+            freeBlocks = Deque(freeBlocks.sorted { freeBlockSizes[$0, default: 0] > freeBlockSizes[$1, default: 0] })
         }
     }
 
-    public func getBlockTable(forSequence id: Int) throws -> [Int32] {
+    private func _getSequence(id: Int) throws -> LogicalSequence {
+        guard let sequence = sequences[id] else {
+            throw KVCacheError.sequenceNotFound
+        }
+        return sequence
+    }
+
+    private func _getBlockTable(forSequence id: Int) throws -> [Int32] {
         guard let sequence = sequences[id] else {
             throw KVCacheError.sequenceNotFound
         }
         return sequence.blockTable
     }
 
+    public func getBlockTable(forSequence id: Int) throws -> [Int32] {
+        lock.lock()
+        defer { lock.unlock() }
+        return try _getBlockTable(forSequence: id)
+    }
+
     public func getBlockTableBuffer(forSequence id: Int) throws -> MTLBuffer {
-        let table = try getBlockTable(forSequence: id)
+        lock.lock()
+        defer { lock.unlock() }
+        let table = try _getBlockTable(forSequence: id)
 
         let bytes = table.isEmpty ? [Int32(0)] : table
 
@@ -290,29 +320,38 @@ public class KVCacheManager: @unchecked Sendable {
     }
 
     public func getSequence(id: Int) throws -> LogicalSequence {
-        guard let sequence = sequences[id] else {
-            throw KVCacheError.sequenceNotFound
-        }
-        return sequence
+        lock.lock()
+        defer { lock.unlock() }
+        return try _getSequence(id: id)
     }
 
     public func getSequenceLength(_ id: Int) throws -> Int {
-        try getSequence(id: id).sequenceLength
+        lock.lock()
+        defer { lock.unlock() }
+        return try _getSequence(id: id).sequenceLength
     }
 
     public func getNumBlocks(forSequence id: Int) throws -> Int {
-        try getSequence(id: id).blockTable.count
+        lock.lock()
+        defer { lock.unlock() }
+        return try _getSequence(id: id).blockTable.count
     }
 
     public var availableBlocks: Int {
+        lock.lock()
+        defer { lock.unlock() }
         return freeBlocks.count
     }
 
     public var activeSequenceCount: Int {
-        sequences.count
+        lock.lock()
+        defer { lock.unlock() }
+        return sequences.count
     }
 
     public func memoryStats() -> KVCacheMemoryStats {
+        lock.lock()
+        defer { lock.unlock() }
         let usedBlocks = maxBlocks - freeBlocks.count
         let bytesPerBlock = blockSize * numKVHeads * headDim * dataType.byteWidth * 2
         let partiallyFilled = sequences.values.reduce(0) { count, sequence in
@@ -356,7 +395,9 @@ public class BatchKVCacheManager: @unchecked Sendable {
     public let blockTablesSlab: MTLBuffer
     public let seqLengthsSlab: MTLBuffer
 
-    private var freeBlocks: [Int32]
+    private let lock = OSAllocatedUnfairLock()
+
+    private var freeBlocks: Deque<Int32>
     public var evictionPolicy: BlockEvictionPolicy = .fifo {
         didSet { rebuildFreeList() }
     }
@@ -376,7 +417,7 @@ public class BatchKVCacheManager: @unchecked Sendable {
         headDim: Int,
         numKVHeads: Int,
         dataType: PagedAttentionDataType = .float16
-    ) {
+    ) throws {
         self.device = device
         self.maxBatchSize = maxBatchSize
         self.maxSequenceBlocks = maxSequenceBlocks
@@ -386,22 +427,32 @@ public class BatchKVCacheManager: @unchecked Sendable {
         self.numKVHeads = numKVHeads
         self.dataType = dataType
 
-        let stride = (dataType == .float16) ? MemoryLayout<Float16>.stride : MemoryLayout<Float>.stride
+        let stride = dataType.byteWidth
         let poolBytes = maxBlocks * blockSize * numKVHeads * headDim * stride
 
-        self.kPoolBuffer = device.makeBuffer(length: poolBytes, options: .storageModeShared)!
-        self.vPoolBuffer = device.makeBuffer(length: poolBytes, options: .storageModeShared)!
+        guard let kPoolBuffer = device.makeBuffer(length: poolBytes, options: .storageModeShared),
+              let vPoolBuffer = device.makeBuffer(length: poolBytes, options: .storageModeShared) else {
+            throw PagedAttentionError.commandEncodingFailed("Failed to allocate KV pool buffers")
+        }
+        self.kPoolBuffer = kPoolBuffer
+        self.vPoolBuffer = vPoolBuffer
 
-        self.freeBlocks = (0..<Int32(maxBlocks)).reversed()
+        self.freeBlocks = Deque((0..<Int32(maxBlocks)).reversed())
         self.prefixCache = [:]
         self.blockRefCounts = [Int32](repeating: 0, count: maxBlocks)
 
         let slabSize = maxBatchSize * maxSequenceBlocks * MemoryLayout<Int32>.stride
-        self.blockTablesSlab = device.makeBuffer(length: slabSize, options: .storageModeShared)!
-        self.seqLengthsSlab = device.makeBuffer(length: maxBatchSize * MemoryLayout<UInt32>.stride, options: .storageModeShared)!
+        guard let blockTablesSlab = device.makeBuffer(length: slabSize, options: .storageModeShared),
+              let seqLengthsSlab = device.makeBuffer(length: maxBatchSize * MemoryLayout<UInt32>.stride, options: .storageModeShared) else {
+            throw PagedAttentionError.commandEncodingFailed("Failed to allocate batch slab buffers")
+        }
+        self.blockTablesSlab = blockTablesSlab
+        self.seqLengthsSlab = seqLengthsSlab
     }
 
     public func allocateSequence(id: Int) throws {
+        lock.lock()
+        defer { lock.unlock() }
         guard sequences[id] == nil else {
             throw KVCacheError.sequenceAlreadyExists
         }
@@ -409,6 +460,8 @@ public class BatchKVCacheManager: @unchecked Sendable {
     }
 
     public func appendTokens(toSequence id: Int, count: Int, blockHashes: [UInt64]? = nil) throws {
+        lock.lock()
+        defer { lock.unlock() }
         guard count >= 0 else {
             throw KVCacheError.invalidRequest("count must be non-negative")
         }
@@ -488,10 +541,14 @@ public class BatchKVCacheManager: @unchecked Sendable {
     }
 
     public func registerBlockHash(_ hash: UInt64, physicalBlock: Int32) {
+        lock.lock()
+        defer { lock.unlock() }
         prefixCache[hash] = physicalBlock
     }
 
     public func ensureExclusiveAccess(sequenceId: Int, logicalBlockIndex: Int) throws {
+        lock.lock()
+        defer { lock.unlock() }
         guard var sequence = sequences[sequenceId] else {
             throw KVCacheError.sequenceNotFound
         }
@@ -506,6 +563,8 @@ public class BatchKVCacheManager: @unchecked Sendable {
     }
 
     public func freeSequence(id: Int) {
+        lock.lock()
+        defer { lock.unlock() }
         if let sequence = sequences.removeValue(forKey: id) {
             let totalBlocks = sequence.blockTable.count
             let remainder = sequence.sequenceLength % blockSize
@@ -516,7 +575,7 @@ public class BatchKVCacheManager: @unchecked Sendable {
                 if blockRefCounts[idx] <= 0 {
                     switch evictionPolicy {
                     case .fifo:
-                        freeBlocks.insert(blockId, at: 0)
+                        freeBlocks.prepend(blockId)
                     case .lifo:
                         freeBlocks.append(blockId)
                     case .bestFit:
@@ -557,10 +616,10 @@ public class BatchKVCacheManager: @unchecked Sendable {
     private func rebuildFreeList() {
         switch evictionPolicy {
         case .fifo:
-            freeBlocks.reverse()
+            freeBlocks = Deque(freeBlocks.reversed())
             freeBlockSizes.removeAll(keepingCapacity: true)
         case .lifo:
-            freeBlocks.reverse()
+            freeBlocks = Deque(freeBlocks.reversed())
             freeBlockSizes.removeAll(keepingCapacity: true)
         case .bestFit:
             for blockId in freeBlocks {
@@ -568,26 +627,38 @@ public class BatchKVCacheManager: @unchecked Sendable {
                     freeBlockSizes[blockId] = blockSize
                 }
             }
-            freeBlocks.sort { freeBlockSizes[$0, default: 0] > freeBlockSizes[$1, default: 0] }
+            freeBlocks = Deque(freeBlocks.sorted { freeBlockSizes[$0, default: 0] > freeBlockSizes[$1, default: 0] })
         }
     }
 
-    public func getSequence(id: Int) throws -> LogicalSequence {
+    private func _getSequence(id: Int) throws -> LogicalSequence {
         guard let sequence = sequences[id] else {
             throw KVCacheError.sequenceNotFound
         }
         return sequence
     }
 
+    public func getSequence(id: Int) throws -> LogicalSequence {
+        lock.lock()
+        defer { lock.unlock() }
+        return try _getSequence(id: id)
+    }
+
     public func getSequenceLength(_ id: Int) throws -> Int {
-        try getSequence(id: id).sequenceLength
+        lock.lock()
+        defer { lock.unlock() }
+        return try _getSequence(id: id).sequenceLength
     }
 
     public func getNumBlocks(forSequence id: Int) throws -> Int {
-        try getSequence(id: id).blockTable.count
+        lock.lock()
+        defer { lock.unlock() }
+        return try _getSequence(id: id).blockTable.count
     }
 
     public func getBatchBlockTableBuffer(forBatch ids: [Int]) throws -> MTLBuffer {
+        lock.lock()
+        defer { lock.unlock() }
         guard ids.count <= maxBatchSize else {
             throw KVCacheError.outOfMemory
         }
@@ -615,6 +686,8 @@ public class BatchKVCacheManager: @unchecked Sendable {
     }
 
     public func getSeqLengthsBuffer(forBatch ids: [Int]) throws -> MTLBuffer {
+        lock.lock()
+        defer { lock.unlock() }
         let ptr = seqLengthsSlab.contents().assumingMemoryBound(to: UInt32.self)
 
         for (idx, seqId) in ids.enumerated() {
@@ -636,6 +709,8 @@ public class BatchKVCacheManager: @unchecked Sendable {
     }
 
     public func memoryStats() -> KVCacheMemoryStats {
+        lock.lock()
+        defer { lock.unlock() }
         let usedBlocks = maxBlocks - freeBlocks.count
         let bytesPerBlock = blockSize * numKVHeads * headDim * dataType.byteWidth * 2
         let partiallyFilled = sequences.values.reduce(0) { count, sequence in

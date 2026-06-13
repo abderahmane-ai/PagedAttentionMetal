@@ -37,7 +37,7 @@ class SyntheticLLM {
         }
         self.outputWeights = (0..<hs * vs).map { _ in Float.random(in: -0.1...0.1) }
         
-        self.cacheManager = KVCacheManager(
+        self.cacheManager = try KVCacheManager(
             device: device,
             maxBlocks: 512,
             blockSize: blockSize,

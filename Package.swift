@@ -27,17 +27,25 @@ let package = Package(
         .executable(
             name: "Profiler",
             targets: ["Profiler"]),
+        .executable(
+            name: "PagedAttentionServer",
+            targets: ["PagedAttentionServer"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.31.0"),
         .package(url: "https://github.com/ml-explore/mlx-swift-lm", from: "3.31.0"),
         .package(url: "https://github.com/huggingface/swift-transformers", branch: "main"),
         .package(url: "https://github.com/huggingface/swift-huggingface", from: "0.1.0"),
+        .package(url: "https://github.com/apple/swift-nio", from: "2.80.0"),
+        .package(url: "https://github.com/apple/swift-collections", from: "1.1.0"),
         .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.4.3"),
     ],
     targets: [
         .target(
             name: "PagedAttentionMetal",
+            dependencies: [
+                .product(name: "Collections", package: "swift-collections"),
+            ],
             resources: [.process("kernels.metal")]
         ),
         .target(
@@ -50,8 +58,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "MinimalLLM",
-            dependencies: ["PagedAttentionMetal"],
-            exclude: ["README.md"]
+            dependencies: ["PagedAttentionMetal"]
         ),
         .executableTarget(
             name: "Benchmarks",
@@ -79,9 +86,31 @@ let package = Package(
             dependencies: ["PagedAttentionMetal"],
             path: "Profiler/Sources"
         ),
+        .executableTarget(
+            name: "PagedAttentionServer",
+            dependencies: [
+                "PagedAttentionMetal",
+                "PagedAttentionMLXSupport",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                .product(name: "MLXLLM", package: "mlx-swift-lm"),
+                .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
+                .product(name: "Hub", package: "swift-transformers"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
+                .product(name: "HuggingFace", package: "swift-huggingface"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
+            ],
+            path: "Sources/PagedAttentionServer"
+        ),
         .testTarget(
             name: "PagedAttentionMetalTests",
-            dependencies: ["PagedAttentionMetal", "PagedAttentionMLXSupport"]),
+            dependencies: [
+                "PagedAttentionMetal",
+                "PagedAttentionMLXSupport",
+                .product(name: "MLXLLM", package: "mlx-swift-lm"),
+            ]),
     ],
     swiftLanguageModes: [.v6]
 )

@@ -37,11 +37,14 @@ struct Profiler {
         // Quick prefill sanity check
         print("sanity check...")
         do {
-            let cache = KVCacheManager(device: device, maxBlocks: 16, blockSize: blockSize, headDim: 64, numKVHeads: 1, dataType: .float32)
+            let cache = try KVCacheManager(device: device, maxBlocks: 16, blockSize: blockSize, headDim: 64, numKVHeads: 1, dataType: .float32)
             try cache.allocateSequence(id: 1)
             try cache.appendTokens(toSequence: 1, count: 64)
-            let bufQ = device.makeBuffer(length: 64 * 4 * 64 * 4)!
-            let bufO = device.makeBuffer(length: 64 * 4 * 64 * 4)!
+            guard let bufQ = device.makeBuffer(length: 64 * 4 * 64 * 4),
+                  let bufO = device.makeBuffer(length: 64 * 4 * 64 * 4) else {
+                print("  FAILED: buffer allocation")
+                return
+            }
             let bt = try cache.getBlockTableBuffer(forSequence: 1)
             try engine.prefill(q: bufQ, kPool: cache.kPoolBuffer, vPool: cache.vPoolBuffer,
                            blockTable: bt, seqLen: 64, headDim: 64, numHeads: 4, numKVHeads: 1,
@@ -63,60 +66,64 @@ struct Profiler {
             let label = dtype == .float32 ? "f32" : "f16"
             print("  dtype=\(label):")
 
-            let cache = KVCacheManager(device: device, maxBlocks: numBlocks + 4, blockSize: blockSize, headDim: headDim, numKVHeads: numKVHeads, dataType: dtype)
+            do {
+                let cache = try KVCacheManager(device: device, maxBlocks: numBlocks + 4, blockSize: blockSize, headDim: headDim, numKVHeads: numKVHeads, dataType: dtype)
 
-            print("    alloc...", terminator: "")
-            try! cache.allocateSequence(id: 1)
-            try! cache.appendTokens(toSequence: 1, count: maxSeqLen)
-            print(" OK")
+                print("    alloc...", terminator: "")
+                try cache.allocateSequence(id: 1)
+                try cache.appendTokens(toSequence: 1, count: maxSeqLen)
+                print(" OK")
 
-            print("    fill KV...", terminator: "")
-            let kPool = cache.kPoolBuffer
-            let vPool = cache.vPoolBuffer
-            let totalElems = numBlocks * blockSize * numKVHeads * headDim
-            if dtype == .float16 {
-                let kPtr = kPool.contents().bindMemory(to: Float16.self, capacity: totalElems)
-                let vPtr = vPool.contents().bindMemory(to: Float16.self, capacity: totalElems)
-                for i in 0..<totalElems { kPtr[i] = Float16(Float.random(in: -1...1)); vPtr[i] = Float16(Float.random(in: -1...1)) }
-            } else {
-                let kPtr = kPool.contents().bindMemory(to: Float.self, capacity: totalElems)
-                let vPtr = vPool.contents().bindMemory(to: Float.self, capacity: totalElems)
-                for i in 0..<totalElems { kPtr[i] = Float.random(in: -1...1); vPtr[i] = Float.random(in: -1...1) }
-            }
-            print(" OK")
-
-            let blockTable = try! cache.getBlockTableBuffer(forSequence: 1)
-
-            let seqLens = [64, 128, 256, 512, 1024, 2048]
-            for seqLen in seqLens {
-                let qCount = seqLen * numHeads * headDim
-                let bufQ: MTLBuffer
-                let bufO: MTLBuffer
+                print("    fill KV...", terminator: "")
+                let kPool = cache.kPoolBuffer
+                let vPool = cache.vPoolBuffer
+                let totalElems = numBlocks * blockSize * numKVHeads * headDim
                 if dtype == .float16 {
-                    bufQ = makeBuffer(device: device, from: [Float16](repeating: 0.5, count: qCount))
-                    bufO = makeBuffer(device: device, from: [Float16](repeating: 0, count: qCount))
+                    let kPtr = kPool.contents().bindMemory(to: Float16.self, capacity: totalElems)
+                    let vPtr = vPool.contents().bindMemory(to: Float16.self, capacity: totalElems)
+                    for i in 0..<totalElems { kPtr[i] = Float16(Float.random(in: -1...1)); vPtr[i] = Float16(Float.random(in: -1...1)) }
                 } else {
-                    bufQ = makeBuffer(device: device, from: [Float](repeating: 0.5, count: qCount))
-                    bufO = makeBuffer(device: device, from: [Float](repeating: 0, count: qCount))
+                    let kPtr = kPool.contents().bindMemory(to: Float.self, capacity: totalElems)
+                    let vPtr = vPool.contents().bindMemory(to: Float.self, capacity: totalElems)
+                    for i in 0..<totalElems { kPtr[i] = Float.random(in: -1...1); vPtr[i] = Float.random(in: -1...1) }
                 }
+                print(" OK")
 
-                var total: Double = 0
-                let iterations = 20
-                for iter in 0..<iterations {
-                    print("    \(label) seqLen=\(seqLen) iter=\(iter+1)/\(iterations)...", terminator: "")
-                    let t = try! time {
-                        try engine.prefill(q: bufQ, kPool: kPool, vPool: vPool,
-                                      blockTable: blockTable,
-                                      seqLen: seqLen, headDim: headDim,
-                                      numHeads: numHeads, numKVHeads: numKVHeads,
-                                      blockSize: blockSize, causal: false,
-                                      output: bufO, dataType: dtype)
+                let blockTable = try cache.getBlockTableBuffer(forSequence: 1)
+
+                let seqLens = [64, 128, 256, 512, 1024, 2048]
+                for seqLen in seqLens {
+                    let qCount = seqLen * numHeads * headDim
+                    let bufQ: MTLBuffer
+                    let bufO: MTLBuffer
+                    if dtype == .float16 {
+                        bufQ = makeBuffer(device: device, from: [Float16](repeating: 0.5, count: qCount))
+                        bufO = makeBuffer(device: device, from: [Float16](repeating: 0, count: qCount))
+                    } else {
+                        bufQ = makeBuffer(device: device, from: [Float](repeating: 0.5, count: qCount))
+                        bufO = makeBuffer(device: device, from: [Float](repeating: 0, count: qCount))
                     }
-                    total += t
-                    print(" \(String(format: "%.2f", t)) ms")
+
+                    var total: Double = 0
+                    let iterations = 20
+                    for iter in 0..<iterations {
+                        print("    \(label) seqLen=\(seqLen) iter=\(iter+1)/\(iterations)...", terminator: "")
+                        let t = try! time {
+                            try engine.prefill(q: bufQ, kPool: kPool, vPool: vPool,
+                                              blockTable: blockTable,
+                                              seqLen: seqLen, headDim: headDim,
+                                              numHeads: numHeads, numKVHeads: numKVHeads,
+                                              blockSize: blockSize, causal: false,
+                                              output: bufO, dataType: dtype)
+                        }
+                        total += t
+                        print(" \(String(format: "%.2f", t)) ms")
+                    }
+                    let avg = total / Double(iterations)
+                    print("    -> avg \(String(format: "%.3f", avg)) ms, \(String(format: "%.0f", Double(seqLen) / (avg/1000))) tok/s")
                 }
-                let avg = total / Double(iterations)
-                print("    -> avg \(String(format: "%.3f", avg)) ms, \(String(format: "%.0f", Double(seqLen) / (avg/1000))) tok/s")
+            } catch {
+                print("  ERROR: \(error)")
             }
         }
 

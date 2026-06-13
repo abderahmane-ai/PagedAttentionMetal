@@ -200,7 +200,7 @@ struct PrecisionBenchmark {
         seqLen: Int, headDim: Int, numHeads: Int, numKVHeads: Int, blockSize: Int,
         q: [Float], k: [Float], v: [Float], dataType: PagedAttentionDataType
     ) throws -> PrecisionOutput {
-        let cacheManager = KVCacheManager(
+        let cacheManager = try KVCacheManager(
             device: device,
             maxBlocks: 512,
             blockSize: blockSize,
